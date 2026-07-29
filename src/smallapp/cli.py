@@ -7,6 +7,7 @@ import sys
 from collections.abc import Sequence
 
 from . import COMMANDS, __version__
+from .gateway import main as gateway_main
 from .naming import ValidationError, gw_port_for, port_for, validate_domain, validate_name
 from .target import TargetError, detect
 
@@ -62,6 +63,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command: str = args.command
     if command == "plan":
         return cmd_plan(args)
+    if command == "gateway":
+        return gateway_main()
     print(f"smallapp {command}: not built yet, see IMPLEMENTATION_PLAN.md", file=sys.stderr)
     return EXIT_UNBUILT
 

@@ -14,12 +14,10 @@ all pass. — closes (1) partially, (2), (3).
 `cli.py` (six commands, `plan` wired), `target.py`, `naming.py`, `tokens.py` and
 their tests. — closes (4), (5), (6), part of (7), (25), (16), (17), half of (20).
 
-## 4. Gateway
+## 4. Gateway (done)
 
-`gateway.py`: stdlib `ThreadingHTTPServer`, the six-row HTTP contract, env config
-with loud failure on missing `SMALLAPP_SECRET`/`SMALLAPP_TOKEN_HASH`. `smallapp
-gateway` now really runs it. Test drives a live server on an ephemeral port.
-This is the first slice a human can *see* work: run it, log in, get a cookie.
+`gateway.py` serves the six-row contract and reverse-proxies authorised requests to
+`SMALLAPP_UPSTREAM`, which is what lets the e2e test run with no Caddy.
 — closes (18), (19), (20).
 
 ## 5. Render
@@ -68,5 +66,7 @@ bare VPS to private URL.
   spec first, in the same commit.
 - The `System` seam is the only place `subprocess` and `os.chown` may appear. Keeping
   it that way is what makes everything else testable on a laptop.
+- The gateway proxies non-`/_smallapp/*` paths itself. In production Caddy already
+  routes around it; the proxy path exists so slice 9 can test the real login flow.
 - Real-host verification (a live VPS with Caddy and systemd) is a manual step
   documented in the README, not a test. Criterion 26 is the automated stand-in.
