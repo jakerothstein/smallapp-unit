@@ -1,3 +1,112 @@
+## QA FINDINGS (round 3, 2026-07-29)
+
+1. **CRITICAL — the untrusted app can steal the gateway secret.**
+   `src/smallapp/templates.py:53,77` runs both services as the same unix user. On
+   Linux, app code can read `/proc/<gateway-pid>/environ` as that UID and recover
+   `SMALLAPP_SECRET`, then forge owner cookies or signal the gateway. Fixed means a
+   distinct gateway UID with no shared writable state, plus a test proving the app
+   cannot read or signal the gateway process.
+
+2. **CRITICAL — `--root` confinement is bypassed by symlinks.**
+   `src/smallapp/system.py:34-42,56-62` joins paths without rejecting symlinked
+   components; `src/smallapp/cli.py:211-217` does the same for `plan --out`. Symlink
+   `<root>/etc` to an outside directory, then write `/etc/escaped` through `System`:
+   the outside file is created. Fixed means symlink-safe, root-confined filesystem
+   operations (for example `openat` plus `O_NOFOLLOW`) and escape regression tests.
+
+3. **HIGH — app code can bypass gateways and reconfigure Caddy.**
+   `src/smallapp/templates.py:31` permits host-network `AF_INET`, while app services
+   share loopback with every app port and Caddy's unauthenticated admin API at
+   `127.0.0.1:2019`. From a deployed app, request another unit's `127.0.0.1:18xxx`
+   port or `http://127.0.0.1:2019/config/`; neither path requires an owner cookie.
+   Fixed means apps cannot reach Caddy administration or other units' ports, proven
+   from inside a deployed service.
+
+4. **HIGH — pre-existing unix users are adopted and later deleted.**
+   `src/smallapp/plan.py:75-80` treats any existing `sa-NAME` user as managed, and
+   `src/smallapp/apply.py:78` deletes it on `rm` without recording ownership. Create
+   `sa-demo` before applying `demo`; apply accepts its unchecked shell/home/UID and
+   removal calls `userdel sa-demo`. Fixed means rejecting unmanaged users or recording
+   and validating ownership, and never deleting a user smallapp did not create.
+
+5. **HIGH — retry after a side-effect failure can report false success.**
+   `src/smallapp/plan.py:103-108` marks reload/service actions unchanged whenever
+   files already match. Inject a first-run Caddy reload failure, then retry: the retry
+   skips Caddy, writes the registry, and exits successfully despite the failed reload.
+   Fixed means incomplete side effects remain pending and are retried before an apply
+   is recorded complete.
+
+6. **HIGH — concurrent applies can lose units and allocate duplicate ports.**
+   `src/smallapp/registry.py:44-81` performs allocation and load-modify-save with no
+   lock. Synchronize two first applies after their registry reads: both can select the
+   same port and the last save drops the other entry. Fixed means locking the complete
+   allocation-through-registration transaction with a concurrent regression test.
+
+7. **HIGH — delayed re-apply still mutates state while saying `no changes`.**
+   `src/smallapp/cli.py:72` regenerates `created_at`, and
+   `src/smallapp/apply.py:54` rewrites the registry. In clean clone
+   `/tmp/qa-1785358093`, a two-second delayed re-apply printed `13 unchanged. no
+   changes.` while the registry SHA changed from `da0668...` to `7f4713...`. Fixed
+   means preserving the registered timestamp and a delayed byte-identical CLI test.
+
+8. **HIGH — the documented install fails and cannot start generated services.**
+   `README.md:58` and `src/smallapp/templates.py:47` use nonexistent
+   `https://github.com/smallapp/unit`; the clean-room `uv tool install` exited 2 with
+   `Repository not found`. Even a corrected default root install lands outside the
+   service PATH, while `src/smallapp/render.py:55-56` renders `/usr/bin/env smallapp
+   gateway`. Fixed means a canonical, system-readable installation and a clean-host
+   test that starts the rendered gateway command under the service PATH and UID.
+
+9. **HIGH — secret env files are created world-readable before chmod.**
+   `src/smallapp/system.py:59-62` uses `Path.write_bytes()` before applying mode 0600.
+   Under umask 022 the predictable temporary env file is initially 0644, allowing a
+   local watcher to retain a readable descriptor and steal the cookie key. Fixed means
+   exclusive creation with mode 0600 before writing, with a test observing creation
+   mode rather than only final mode.
+
+10. **MEDIUM — removed static files remain deployed.**
+    `src/smallapp/render.py:110-122` only renders current files and
+    `src/smallapp/apply.py:30-54` never reconciles old payloads. Apply a static target
+    containing `old.txt`, remove it from the source, and re-apply: deployed `old.txt`
+    remains available. Fixed means removing payload files absent from the new target,
+    with a regression test.
+
+11. **MEDIUM — comments and strings still satisfy Python target validation.**
+    `src/smallapp/target.py:12,56-66` searches raw source for `PORT`. In the clean
+    clone, a file containing `# PORT` and `print("not a server")` made `smallapp plan`
+    exit 0. Fixed means requiring an actual environment-variable access and testing
+    comment-only and string-only false positives.
+
+12. **MEDIUM — doctor still accepts a commented-out Caddy import.**
+    `src/smallapp/system.py:175-180` uses substring membership. A prepared clean-room
+    prefix whose Caddyfile contained only `# import smallapp.d/*.caddy` made
+    `smallapp doctor --root` exit 0. Fixed means recognizing an active directive and
+    testing the CLI against commented and malformed imports.
+
+13. **MEDIUM — removal still hides unix-user deletion failure.**
+    `src/smallapp/system.py:103-109` invokes `userdel` with `allow_fail=True`, while
+    `src/smallapp/apply.py:78-86` drops state and reports success. Keep a process alive
+    as the unit user and remove the unit: `userdel` can fail while the CLI says removed.
+    Fixed means an unexpected failure exits non-zero, names the step, and preserves
+    enough registry state to retry.
+
+14. **MEDIUM — the static end-to-end assertion weakens criterion 22.**
+    `tests/test_e2e.py:199-202` asserts `root * /opt/smallapp/notes`, while
+    `specs/smallapp-unit.md:302-303` requires `root * <prefix>/opt/smallapp/NAME`.
+    Fixed means the generated prefixed vhost and test match the stated criterion, or
+    the specification is explicitly amended before implementation.
+
+15. **LOW — logout still accepts methods outside the HTTP contract.**
+    `src/smallapp/gateway.py:145-155,221-229` expires cookies for every method. The
+    live clean-room gateway returned 303 plus `Max-Age=0` for
+    `GET /_smallapp/logout`. Fixed means non-POST methods return 405 without changing
+    cookies, covered by a method-contract test.
+
+16. **LOW — README overstates what doctor checks.**
+    `README.md:27-29` says doctor checks all listed host requirements, including DNS
+    and open ports 80/443; `src/smallapp/system.py:168-190` checks neither. Fixed means
+    correcting the claim or implementing actionable DNS and port checks.
+
 ## QA FINDINGS (round 2, 2026-07-29)
 
 1. **HIGH — delayed re-apply mutates state while reporting no changes.**
