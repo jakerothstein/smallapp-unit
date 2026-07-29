@@ -8,6 +8,7 @@ or an env file.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from zlib import crc32
 
@@ -98,3 +99,55 @@ def port_for(name: str, taken: frozenset[int] | set[int] | None = None) -> int:
 
 def gw_port_for(port: int) -> int:
     return port + GW_PORT_OFFSET
+
+
+@dataclass(frozen=True)
+class Unit:
+    """One deploy unit's identity. Never holds a secret: the registry stores this."""
+
+    name: str
+    domain: str
+    kind: str
+    port: int
+    gw_port: int
+    tls: str
+    created_at: str
+
+    def __post_init__(self) -> None:
+        validate_name(self.name)
+        validate_domain(self.domain)
+        if self.kind not in ("python", "static"):
+            raise ValidationError(f"unknown unit kind {self.kind!r}")
+        if self.tls not in ("acme", "internal"):
+            raise ValidationError(f"unknown tls mode {self.tls!r}")
+        for port in (self.port, self.gw_port):
+            if not 1 <= port <= 65535:
+                raise ValidationError(f"port {port} is outside 1..65535")
+
+    @property
+    def user(self) -> str:
+        return user_for(self.name)
+
+    @property
+    def app_dir(self) -> PurePosixPath:
+        return OPT_DIR / self.name
+
+    @property
+    def state_dir(self) -> PurePosixPath:
+        return STATE_DIR / self.name
+
+    @property
+    def env_path(self) -> PurePosixPath:
+        return ENV_DIR / f"{self.name}.env"
+
+    @property
+    def service_path(self) -> PurePosixPath:
+        return UNIT_DIR / service_for(self.name)
+
+    @property
+    def gw_service_path(self) -> PurePosixPath:
+        return UNIT_DIR / gw_service_for(self.name)
+
+    @property
+    def vhost_path(self) -> PurePosixPath:
+        return CADDY_DIR / f"{self.name}.caddy"

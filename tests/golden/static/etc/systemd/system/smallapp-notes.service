@@ -1,0 +1,51 @@
+[Unit]
+Description=smallapp notes (static)
+Documentation=https://github.com/smallapp/unit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sa-notes
+Group=sa-notes
+WorkingDirectory=/opt/smallapp/notes
+Environment=PORT=18500
+Environment=HOME=/var/lib/smallapp/notes
+ExecStart=/bin/sh -c 'exec python3 -m http.server "$PORT" --bind 127.0.0.1 --directory /opt/smallapp/notes'
+Restart=always
+RestartSec=1
+StateDirectory=smallapp/notes
+MemoryMax=512M
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+PrivateMounts=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+RemoveIPC=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

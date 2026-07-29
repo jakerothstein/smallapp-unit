@@ -20,11 +20,10 @@ their tests. — closes (4), (5), (6), part of (7), (25), (16), (17), half of (2
 `SMALLAPP_UPSTREAM`, which is what lets the e2e test run with no Caddy.
 — closes (18), (19), (20).
 
-## 5. Render
+## 5. Render (done)
 
-`templates.py` + `render.py`: pure `(Target, Unit) -> dict[path, RenderedFile]`.
-App unit, gateway unit, vhost, env file, payload. Golden files under `tests/golden/`.
-`smallapp plan --out DIR` writes them. Directive-by-directive assertions.
+`templates.py` + `render.py`, goldens under `tests/golden/`, `plan --out DIR` writes
+them. Regenerate goldens with `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py`.
 — closes (8), (9), (10).
 
 ## 6. Registry
@@ -68,5 +67,11 @@ bare VPS to private URL.
   it that way is what makes everything else testable on a laptop.
 - The gateway proxies non-`/_smallapp/*` paths itself. In production Caddy already
   routes around it; the proxy path exists so slice 9 can test the real login flow.
+- `Unit` lives in `naming.py` (lowest layer) so registry/plan/apply/render can all
+  see it without an import cycle.
+- Dependency-free scripts render `python3 app.py`; only a PEP 723 header renders
+  `uv run --script`. That is what keeps the e2e test offline.
+- The app unit gets `Environment=PORT=`, never the env file: secrets stay with the
+  gateway.
 - Real-host verification (a live VPS with Caddy and systemd) is a manual step
   documented in the README, not a test. Criterion 26 is the automated stand-in.

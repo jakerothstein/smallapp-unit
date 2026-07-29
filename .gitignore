@@ -10,3 +10,4 @@ build/
 .coverage
 *.env
 !*.env.example
+!tests/golden/**/*.env

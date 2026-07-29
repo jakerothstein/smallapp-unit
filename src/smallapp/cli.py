@@ -5,11 +5,22 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
 from . import COMMANDS, __version__
 from .gateway import main as gateway_main
-from .naming import ValidationError, gw_port_for, port_for, validate_domain, validate_name
+from .naming import (
+    Unit,
+    ValidationError,
+    gw_port_for,
+    port_for,
+    validate_domain,
+    validate_name,
+)
+from .render import RenderedFile, render
 from .target import TargetError, detect
+from .tokens import generate_secret, generate_token, hash_token
 
 HELP = {
     "plan": "render a deploy unit and show what would change (writes nothing)",
@@ -53,9 +64,41 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_TARGET
     port = port_for(name)
+    unit = Unit(
+        name=name,
+        domain=domain,
+        kind=target.kind,
+        port=port,
+        gw_port=gw_port_for(port),
+        tls=args.tls,
+        created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+    files = render(target, unit, generate_secret(), hash_token(generate_token()))
     print(f"plan: {name} ({target.kind}, 127.0.0.1:{port}) -> https://{domain}")
-    print(f"      gateway 127.0.0.1:{gw_port_for(port)}, tls {args.tls}")
+    print(f"      gateway 127.0.0.1:{unit.gw_port}, tls {args.tls}")
+    print()
+    for path in sorted(files):
+        rendered = files[path]
+        mode = "  (0600)" if rendered.mode == 0o600 else ""
+        print(f"  + file      {path}{mode}")
+    print(f"  + user      {unit.user}")
+    print("  + reload    caddy")
+    if args.out:
+        written = write_out(files, Path(args.out))
+        print(f"\nwrote {written} files under {args.out}")
+    else:
+        print("\nnothing applied; run `smallapp apply`")
     return EXIT_OK
+
+
+def write_out(files: dict[str, RenderedFile], out: Path) -> int:
+    """Mirror every rendered file under `out`, keeping its absolute path shape."""
+    for path, rendered in files.items():
+        destination = out / path.lstrip("/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(rendered.content)
+        destination.chmod(rendered.mode)
+    return len(files)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
