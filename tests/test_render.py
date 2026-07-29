@@ -230,3 +230,50 @@ def test_golden_files_match(python_target: Target, static_target: Target, flavou
     assert set(stored) == set(rendered), "golden file set drifted; UPDATE_GOLDEN=1 to refresh"
     for path in sorted(rendered):
         assert stored[path] == rendered[path], f"{path} changed; UPDATE_GOLDEN=1 to refresh"
+
+
+def _units(target: Target) -> tuple[str, str]:
+    files = render(target, python_unit(), SECRET, TOKEN_HASH)
+    return (
+        files["/etc/systemd/system/smallapp-expenses.service"].text,
+        files["/etc/systemd/system/smallapp-expenses-gw.service"].text,
+    )
+
+
+def test_the_gateway_runs_as_its_own_user(python_target: Target) -> None:
+    """QA round 3 #1: same uid means the app can read /proc/<gw>/environ and lift the
+    HMAC secret. The two services must not share an account."""
+    app_unit, gw_unit = _units(python_target)
+    assert "User=sa-expenses\n" in app_unit
+    assert "Group=sa-expenses\n" in app_unit
+    assert "User=sa-expenses-gw\n" in gw_unit
+    assert "Group=sa-expenses-gw\n" in gw_unit
+    assert "User=sa-expenses\n" not in gw_unit
+
+
+def test_the_two_services_share_no_writable_state(python_target: Target) -> None:
+    app_unit, gw_unit = _units(python_target)
+    assert "StateDirectory=smallapp/expenses\n" in app_unit
+    assert "StateDirectory=smallapp/expenses-gw\n" in gw_unit
+    assert "WorkingDirectory=/opt/smallapp/expenses\n" in app_unit  # root-owned, read-only
+    assert "WorkingDirectory=/var/lib/smallapp/expenses-gw\n" in gw_unit
+
+
+def test_processes_of_other_users_are_invisible(python_target: Target) -> None:
+    for unit_text in _units(python_target):
+        assert "ProtectProc=invisible" in unit_text
+        assert "ProcSubset=pid" in unit_text
+
+
+def test_each_service_may_bind_only_its_own_port(python_target: Target) -> None:
+    """QA round 3 #3: an app must not be able to squat another unit's loopback port."""
+    app_unit, gw_unit = _units(python_target)
+    assert "SocketBindAllow=tcp:18412\nSocketBindDeny=any\n" in app_unit
+    assert "SocketBindAllow=tcp:19412\nSocketBindDeny=any\n" in gw_unit
+
+
+def test_generated_units_document_the_real_repository(python_target: Target) -> None:
+    """QA round 3 #8: `smallapp/unit` does not exist; a stranger must find the source."""
+    for unit_text in _units(python_target):
+        assert "Documentation=https://github.com/jakerothstein/smallapp-unit" in unit_text
+        assert "github.com/smallapp/unit" not in unit_text

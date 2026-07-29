@@ -1,6 +1,6 @@
 [Unit]
 Description=smallapp expenses (python)
-Documentation=https://github.com/smallapp/unit
+Documentation=https://github.com/jakerothstein/smallapp-unit
 After=network-online.target
 Wants=network-online.target
 
@@ -17,6 +17,8 @@ RestartSec=1
 StateDirectory=smallapp/expenses
 MemoryMax=512M
 TasksMax=64
+SocketBindAllow=tcp:18412
+SocketBindDeny=any
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

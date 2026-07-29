@@ -230,3 +230,55 @@ def test_wrong_token_never_opens_the_app(tmp_path: Path, app_file: Path) -> None
         status, _, body = request(gw_port, "GET", "/")
         assert status == 401
         assert b"hello" not in body
+
+
+SERVICE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+
+
+@pytest.mark.slow
+def test_documented_install_puts_smallapp_on_the_service_path(
+    tmp_path: Path, app_file: Path
+) -> None:
+    """QA round 3 #8: the README's install must produce a `smallapp` that the rendered
+    `ExecStart=/usr/bin/env smallapp gateway` can find with only the service PATH, and
+    that a user other than root can read. Needs network the first time (uv resolves the
+    build backend), hence `slow`.
+    """
+    tool_dir, bin_dir = tmp_path / "opt/uv/tools", tmp_path / "usr/local/bin"
+    bin_dir.mkdir(parents=True)
+    install = subprocess.run(  # noqa: S603
+        [
+            "uv",
+            "tool",
+            "install",
+            "--from",
+            str(Path(__file__).resolve().parents[1]),
+            "smallapp-unit",
+        ],  # noqa: S607, E501
+        env={**os.environ, "UV_TOOL_DIR": str(tool_dir), "UV_TOOL_BIN_DIR": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stderr
+    subprocess.run(["chmod", "-R", "a+rX", str(tool_dir)], check=True)  # noqa: S603, S607
+    assert (bin_dir / "smallapp").exists(), sorted(p.name for p in bin_dir.iterdir())
+
+    root = tmp_path / "root"
+    root.mkdir()
+    token = apply_unit_cli(app_file, "installed", root)
+    app_port, gw_port = free_port(), free_port()
+    env = gateway_env(root, "installed", app_port, gw_port)
+    # Exactly what systemd hands the unit: no inherited venv, only the service PATH.
+    env["PATH"] = os.pathsep.join([str(bin_dir), *SERVICE_PATH.split(":")])
+    env["UV_TOOL_DIR"] = str(tool_dir)
+    gw_cmd = exec_start(root / "etc/systemd/system/smallapp-installed-gw.service", root)
+    assert gw_cmd == ["/usr/bin/env", "smallapp", "gateway"]
+
+    app_env = {
+        **env,
+        "PATH": os.pathsep.join([str(Path(sys.executable).parent), *SERVICE_PATH.split(":")]),
+    }
+    app_cmd = exec_start(root / "etc/systemd/system/smallapp-installed.service", root)
+    with running(app_cmd, app_env, app_port), running(gw_cmd, env, gw_port):
+        walk_login_path(gw_port, token, b"hello")

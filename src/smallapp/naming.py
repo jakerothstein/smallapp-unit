@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from zlib import crc32
 
-NAME_MAX = 32
+NAME_MAX = 26  # `sa-NAME-gw` must still fit the 32-char unix username limit
 NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 DOMAIN_MAX = 253
@@ -36,7 +36,7 @@ class ValidationError(ValueError):
 def validate_name(name: str) -> str:
     """Return `name` if it is a legal unit name, else raise naming it."""
     if not name:
-        raise ValidationError("unit name is empty: names must match [a-z0-9-], 1-32 chars")
+        raise ValidationError(f"unit name is empty: names must match [a-z0-9-], 1-{NAME_MAX} chars")
     if len(name) > NAME_MAX:
         raise ValidationError(f"unit name {name!r} is {len(name)} chars, the maximum is {NAME_MAX}")
     if not NAME_RE.match(name):
@@ -71,6 +71,12 @@ def user_for(name: str) -> str:
     return f"sa-{validate_name(name)}"
 
 
+def gw_user_for(name: str) -> str:
+    """The gateway's own uid. Separate from the app's so app code cannot read the
+    gateway's `/proc/PID/environ` and lift `SMALLAPP_SECRET` out of it."""
+    return f"sa-{validate_name(name)}-gw"
+
+
 def service_for(name: str) -> str:
     return f"smallapp-{validate_name(name)}.service"
 
@@ -103,7 +109,12 @@ def gw_port_for(port: int) -> int:
 
 @dataclass(frozen=True)
 class Unit:
-    """One deploy unit's identity. Never holds a secret: the registry stores this."""
+    """One deploy unit's identity and bookkeeping. Never holds a secret.
+
+    `created_user` records that smallapp created the unix users, so `rm` never deletes
+    a pre-existing account. `complete` records that the last apply finished its side
+    effects, so a retry after a failed reload does the reload again.
+    """
 
     name: str
     domain: str
@@ -112,6 +123,8 @@ class Unit:
     gw_port: int
     tls: str
     created_at: str
+    created_user: bool = False
+    complete: bool = False
 
     def __post_init__(self) -> None:
         validate_name(self.name)
@@ -129,12 +142,21 @@ class Unit:
         return user_for(self.name)
 
     @property
+    def gw_user(self) -> str:
+        return gw_user_for(self.name)
+
+    @property
     def app_dir(self) -> PurePosixPath:
         return OPT_DIR / self.name
 
     @property
     def state_dir(self) -> PurePosixPath:
         return STATE_DIR / self.name
+
+    @property
+    def gw_state_dir(self) -> PurePosixPath:
+        """The gateway's own writable state, shared with nothing."""
+        return STATE_DIR / f"{self.name}-gw"
 
     @property
     def env_path(self) -> PurePosixPath:

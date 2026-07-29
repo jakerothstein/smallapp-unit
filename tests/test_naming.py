@@ -17,12 +17,14 @@ from smallapp.naming import (
 )
 
 
-@pytest.mark.parametrize("name", ["a", "my-app", "app2", "x" * 32])
+@pytest.mark.parametrize("name", ["a", "my-app", "app2", "x" * 26])
 def test_valid_names(name: str) -> None:
     assert validate_name(name) == name
 
 
-@pytest.mark.parametrize("name", ["", "-lead", "trail-", "Upper", "has_underscore", "x" * 33])
+@pytest.mark.parametrize(
+    "name", ["", "-lead", "trail-", "Upper", "has_underscore", "x" * 27, "x" * 33]
+)
 def test_invalid_names_name_the_offender(name: str) -> None:
     with pytest.raises(ValidationError) as exc:
         validate_name(name)

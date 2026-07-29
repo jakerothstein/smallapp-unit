@@ -1,20 +1,24 @@
 [Unit]
 Description=smallapp expenses auth gateway
+Documentation=https://github.com/jakerothstein/smallapp-unit
 After=network-online.target smallapp-expenses.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=sa-expenses
-Group=sa-expenses
-WorkingDirectory=/opt/smallapp/expenses
+User=sa-expenses-gw
+Group=sa-expenses-gw
+WorkingDirectory=/var/lib/smallapp/expenses-gw
+Environment=HOME=/var/lib/smallapp/expenses-gw
 EnvironmentFile=/etc/smallapp/expenses.env
 ExecStart=/usr/bin/env smallapp gateway
 Restart=always
 RestartSec=1
-StateDirectory=smallapp/expenses
+StateDirectory=smallapp/expenses-gw
 MemoryMax=128M
 TasksMax=32
+SocketBindAllow=tcp:19412
+SocketBindDeny=any
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

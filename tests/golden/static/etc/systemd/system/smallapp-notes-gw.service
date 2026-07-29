@@ -1,20 +1,24 @@
 [Unit]
 Description=smallapp notes auth gateway
+Documentation=https://github.com/jakerothstein/smallapp-unit
 After=network-online.target smallapp-notes.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=sa-notes
-Group=sa-notes
-WorkingDirectory=/opt/smallapp/notes
+User=sa-notes-gw
+Group=sa-notes-gw
+WorkingDirectory=/var/lib/smallapp/notes-gw
+Environment=HOME=/var/lib/smallapp/notes-gw
 EnvironmentFile=/etc/smallapp/notes.env
 ExecStart=/usr/bin/env smallapp gateway
 Restart=always
 RestartSec=1
-StateDirectory=smallapp/notes
+StateDirectory=smallapp/notes-gw
 MemoryMax=128M
 TasksMax=32
+SocketBindAllow=tcp:19500
+SocketBindDeny=any
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

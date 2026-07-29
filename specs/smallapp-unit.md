@@ -35,9 +35,10 @@ A **unit** named `NAME` is this set of artifacts, and nothing else:
 
 | Artifact | Path |
 | --- | --- |
-| dedicated unix user | `sa-NAME` (system, `/usr/sbin/nologin`, no home) |
+| dedicated app unix user | `sa-NAME` (system, `/usr/sbin/nologin`, no home) |
+| dedicated gateway unix user | `sa-NAME-gw` (system, `/usr/sbin/nologin`, no home) |
 | app payload | `/opt/smallapp/NAME/` (root-owned, world-readable, app cannot write it) |
-| writable state | `/var/lib/smallapp/NAME/` (via `StateDirectory=`) |
+| writable state | `/var/lib/smallapp/NAME/` and `/var/lib/smallapp/NAME-gw/` (via `StateDirectory=`) |
 | secrets | `/etc/smallapp/NAME.env` (mode 0600, root-owned) |
 | app service | `/etc/systemd/system/smallapp-NAME.service` (hardened) |
 | auth gateway service | `/etc/systemd/system/smallapp-NAME-gw.service` (hardened) |
@@ -53,11 +54,31 @@ Properties v1 guarantees:
    `systemd-analyze security`.
 3. **Private by default.** Every unit sits behind a self-contained signed-cookie
    gateway. No OAuth provider, no Redis, no Cloudflare account, no Caddy plugin —
-   stock Caddy `forward_auth` pointing at a ~150-line stdlib HTTP service.
+   stock Caddy `forward_auth` pointing at a ~150-line stdlib HTTP service. The gateway
+   runs as its own uid with its own state directory, so app code cannot read the
+   gateway's environment and forge an owner cookie.
 4. **Free TLS.** Caddy + Let's Encrypt: no signup, no credential, no env var.
    `--tls internal` uses Caddy's local CA for CI and LAN use.
 5. **Reversible.** `smallapp rm NAME` removes every artifact above and leaves the
-   host as it was.
+   host as it was. It never deletes a unix user smallapp did not create.
+
+### Threat model (v1)
+
+Trusted: root, systemd, Caddy, and the operator. Untrusted: the deployed app, which is
+assumed to be unaudited agent-written code, and the internet.
+
+What is enforced: an app cannot read another unit's files, the gateway's environment,
+or the rest of the box (`ProtectSystem=strict`, per-unit uids, `ProtectProc=invisible`,
+no capabilities, a syscall filter); it cannot bind a port other than its own
+(`SocketBindDeny=any`); it cannot reach Caddy's admin API, which `doctor` requires to
+be `off` or on a unix socket rather than `127.0.0.1:2019`; and nothing reaches the app
+from the internet without an owner cookie.
+
+What is **not** enforced: apps share the host loopback interface, so one deployed app
+can connect to another unit's `127.0.0.1:18xxx`. Per-cgroup packet filtering would be
+needed to close that, and firewall management is a non-goal; the gateway, not the
+network, is the auth boundary. This is stated so it is a documented limit rather than
+an assumed guarantee.
 
 ### Non-goals (v1)
 
@@ -162,9 +183,11 @@ past, any wrong version prefix fails closed.
 
 ### `smallapp doctor [--root /]`
 
-Host preflight (implemented as `system.preflight`): systemd present, Caddy present and its Caddyfile imports
-`smallapp.d/*.caddy`, `uv` present, running as root. Exit 0 if the host can host;
-exit 1 listing each failed check and the exact command to fix it.
+Host preflight (implemented as `system.preflight`): systemd present, Caddy present,
+its Caddyfile carries an *active* (not commented-out) `import smallapp.d/*.caddy`
+directive, its admin API is `off` or on a unix socket rather than a TCP port, `uv`
+present, running as root. Exit 0 if the host can host; exit 1 listing each failed check
+and the exact command to fix it. It does not check DNS or that ports 80/443 are open.
 
 ## Architecture
 
@@ -216,7 +239,13 @@ Action  = (verb: Literal["mkdir","write","chown","chmod","user","systemctl",
            state: Literal["create","change","unchanged"])
 ```
 
-Registry is `{"version": 1, "units": {NAME: Unit}}`. Ports are allocated
+`Unit` also records `created_user` (smallapp created `sa-NAME`/`sa-NAME-gw`, so `rm`
+may delete them) and `complete` (the last apply finished its side effects, so a retry
+after a failed reload redoes the reload instead of reporting success).
+
+Registry is `{"version": 1, "units": {NAME: Unit}}`. Allocation through registration
+runs under an exclusive `flock` on `/var/lib/smallapp`, so concurrent applies cannot
+pick the same port or drop each other's entry. Ports are allocated
 deterministically (`18000 + crc32(name) % 1000`, gateway `+1000`) then linearly
 probed against the registry, so a name keeps its port forever unless it is taken.
 
@@ -254,8 +283,9 @@ Every item is checkable by `pytest` or by a command's exit code.
    mentioning `PORT`; a nonexistent path → error mentioning the path; a directory
    without `index.html` → error mentioning `index.html`. All five asserted.
 6. `naming.validate()` accepts `a`, `my-app`, `app2`; rejects empty, `-lead`,
-   `trail-`, `Upper`, `has_underscore`, and anything over 32 chars. Each rejection
-   raises with the offending name in the message.
+   `trail-`, `Upper`, `has_underscore`, and anything over 26 chars (`sa-NAME-gw` must
+   fit the 32-character unix username limit). Each rejection raises with the offending
+   name in the message.
 7. `naming.port_for("expenses")` is deterministic across processes and within
    `18000..18999`; a name whose slot is occupied in the registry gets the next free
    port, asserted by a test that pre-seeds a collision.
@@ -300,7 +330,9 @@ Every item is checkable by `pytest` or by a command's exit code.
     (g) `POST /_smallapp/logout` then re-requests → 401 again.
     One test, asserted at every step.
 22. **End-to-end static:** same as 21 for a static directory target, asserting the
-    rendered vhost contains `file_server` and `root * <prefix>/opt/smallapp/NAME`.
+    rendered vhost contains `file_server` and `root * /opt/smallapp/NAME`. The vhost is
+    rendered for the real host, so it names the final absolute path even when written
+    into a `--root` prefix; Caddy is not running under the prefix.
 23. `smallapp status --json` after an apply emits valid JSON whose object for `NAME`
     has `kind`, `port`, `gw_port`, `domain`, `tls`; asserted by parsing.
 24. `smallapp doctor` on a host missing prerequisites exits 1 and its stderr names

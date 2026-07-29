@@ -44,7 +44,7 @@ UMask=0077
 APP_UNIT = """\
 [Unit]
 Description=smallapp {name} ({kind})
-Documentation=https://github.com/smallapp/unit
+Documentation=https://github.com/jakerothstein/smallapp-unit
 After=network-online.target
 Wants=network-online.target
 
@@ -61,6 +61,8 @@ RestartSec=1
 StateDirectory=smallapp/{name}
 MemoryMax={memory_max}
 TasksMax=64
+SocketBindAllow=tcp:{port}
+SocketBindDeny=any
 {hardening}
 [Install]
 WantedBy=multi-user.target
@@ -69,21 +71,25 @@ WantedBy=multi-user.target
 GW_UNIT = """\
 [Unit]
 Description=smallapp {name} auth gateway
+Documentation=https://github.com/jakerothstein/smallapp-unit
 After=network-online.target smallapp-{name}.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User={user}
-Group={user}
-WorkingDirectory={app_dir}
+User={gw_user}
+Group={gw_user}
+WorkingDirectory=/var/lib/smallapp/{name}-gw
+Environment=HOME=/var/lib/smallapp/{name}-gw
 EnvironmentFile={env_path}
 ExecStart={gw_exec_start}
 Restart=always
 RestartSec=1
-StateDirectory=smallapp/{name}
+StateDirectory=smallapp/{name}-gw
 MemoryMax={gw_memory_max}
 TasksMax=32
+SocketBindAllow=tcp:{gw_port}
+SocketBindDeny=any
 {hardening}
 [Install]
 WantedBy=multi-user.target

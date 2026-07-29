@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import re
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 Kind = Literal["python", "static"]
 
-PORT_RE = re.compile(r"\bPORT\b")
+PORT_VAR = "PORT"
 INDEX = "index.html"
 MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
 
@@ -32,6 +32,45 @@ class Target:
                 raise TargetError(f"{self.root}: python target has no entry file")
             return [self.entry]
         return sorted(p for p in self.root.rglob("*") if p.is_file())
+
+
+def _is_environ(node: ast.expr) -> bool:
+    """`os.environ`, `environ`, or `os.environb`-style access to the process env."""
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("environ", "environb")
+    return isinstance(node, ast.Name) and node.id in ("environ", "environb")
+
+
+def _is_port_literal(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value in (PORT_VAR, PORT_VAR.encode())
+
+
+def reads_port(source: str) -> bool:
+    """True only when the source really *reads* `PORT` from the environment.
+
+    A comment mentioning PORT or a bare string "PORT" is not a server; the check is on
+    the syntax tree, so neither can satisfy it.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and _is_environ(node.value):
+            if _is_port_literal(node.slice):
+                return True
+        elif isinstance(node, ast.Call) and _is_port_call(node):
+            return True
+    return False
+
+
+def _is_port_call(node: ast.Call) -> bool:
+    if not node.args or not _is_port_literal(node.args[0]):
+        return False
+    function = node.func
+    if isinstance(function, ast.Attribute):
+        # os.getenv("PORT") / os.environ.get("PORT")
+        return function.attr in ("getenv", "getenvb") or (
+            function.attr == "get" and _is_environ(function.value)
+        )
+    return isinstance(function, ast.Name) and function.id in ("getenv", "getenvb")
 
 
 def detect(path: str | Path) -> Target:
@@ -57,7 +96,11 @@ def _detect_python(shown: Path, resolved: Path) -> Target:
         source = resolved.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise TargetError(f"{shown}: not valid UTF-8 Python source ({exc.reason})") from exc
-    if not PORT_RE.search(source):
+    try:
+        found = reads_port(source)
+    except SyntaxError as exc:
+        raise TargetError(f"{shown}: is not valid Python ({exc.msg} on line {exc.lineno})") from exc
+    if not found:
         raise TargetError(
             f"{shown} never reads the PORT environment variable.\n"
             "       smallapp apps must serve on 127.0.0.1:$PORT. Example:\n"

@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,9 +16,9 @@ import pytest
 from conftest import FIXED_SECRETS, make_unit, tree_hash
 from smallapp import registry
 from smallapp.apply import apply_unit, remove_unit
-from smallapp.plan import resolve_secrets
+from smallapp.naming import ValidationError
 from smallapp.system import StepError, System
-from smallapp.target import Target
+from smallapp.target import Target, detect
 
 
 def test_apply_writes_every_artifact_with_the_right_mode(
@@ -152,20 +156,161 @@ def test_cli_status_of_unknown_unit_fails(tmp_path: Path) -> None:
 
 
 def test_secret_never_leaks_into_plan_output(tmp_path: Path, app_file: Path) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    run_cli(
-        "apply",
+    """QA round 2 #8: read the secret *this* plan rendered, not an unrelated one."""
+    out = tmp_path / "out"
+    planned = run_cli(
+        "plan",
         str(app_file),
         "--name",
         "expenses",
         "--domain",
         "e.example.com",
+        "--out",
+        str(out),
+    )
+    assert planned.returncode == 0, planned.stderr
+    values = dict(
+        line.split("=", 1)
+        for line in (out / "etc/smallapp/expenses.env").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert values["SMALLAPP_SECRET"] and values["SMALLAPP_TOKEN_HASH"]
+    for stream in (planned.stdout, planned.stderr):
+        assert values["SMALLAPP_SECRET"] not in stream
+        assert values["SMALLAPP_TOKEN_HASH"] not in stream
+    assert (out / "etc/smallapp/expenses.env").stat().st_mode & 0o777 == 0o600
+
+
+def test_plan_out_cannot_be_walked_out_of_by_a_symlink(tmp_path: Path, app_file: Path) -> None:
+    """QA round 3 #2: `--out` confinement is the same promise as `--root`."""
+    out = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (out / "etc").mkdir(parents=True)
+    (out / "etc/smallapp").symlink_to(outside)
+    planned = run_cli(
+        "plan", str(app_file), "--name", "e", "--domain", "e.example.com", "--out", str(out)
+    )
+    assert planned.returncode != 0
+    assert "symlink" in planned.stderr
+    assert list(outside.iterdir()) == []
+
+
+def apply_args(source: Path, name: str, root: Path) -> list[str]:
+    return [
+        "apply",
+        str(source),
+        "--name",
+        name,
+        "--domain",
+        f"{name}.example.com",
         "--root",
         str(root),
-    )
-    system = System(root)
-    secrets = resolve_secrets(system, make_unit())
-    planned = run_cli("plan", str(app_file), "--name", "expenses", "--domain", "e.example.com")
-    assert secrets.secret not in planned.stdout
-    assert secrets.token_hash not in planned.stdout
+    ]
+
+
+def test_a_delayed_reapply_changes_not_one_byte(tmp_path: Path, app_file: Path) -> None:
+    """QA round 3 #7: `no changes.` must mean the registry is untouched, clock or not."""
+    root = tmp_path / "root"
+    root.mkdir()
+    assert run_cli(*apply_args(app_file, "expenses", root)).returncode == 0
+    registry_file = root / "var/lib/smallapp/registry.json"
+    before_hash, before_tree = registry_file.read_bytes(), tree_hash(root)
+
+    time.sleep(2.1)
+    again = run_cli(*apply_args(app_file, "expenses", root))
+    assert again.returncode == 0, again.stderr
+    assert "no changes." in again.stdout
+    assert registry_file.read_bytes() == before_hash
+    assert tree_hash(root) == before_tree
+
+
+def test_a_preexisting_unix_user_is_never_adopted(host: System, python_target: Target) -> None:
+    """QA round 3 #4: an account smallapp did not make must not be taken over."""
+    host.create_user("sa-expenses")
+    with pytest.raises(ValidationError, match="sa-expenses"):
+        apply_unit(host, python_target, make_unit(), FIXED_SECRETS)
+    assert registry.load(host) == {}
+    assert host.user_exists("sa-expenses"), "the foreign account must survive"
+
+
+def test_rm_never_deletes_a_user_smallapp_did_not_create(
+    host: System, python_target: Target
+) -> None:
+    unit = make_unit()
+    apply_unit(host, python_target, unit, FIXED_SECRETS)
+    registry.put(host, replace(registry.load(host)["expenses"], created_user=False))
+    assert remove_unit(host, "expenses") is not None
+    assert host.user_exists("sa-expenses"), "an adopted account must outlive the unit"
+    assert host.user_exists("sa-expenses-gw")
+
+
+def test_rm_deletes_both_users_it_created(host: System, python_target: Target) -> None:
+    apply_unit(host, python_target, make_unit(), FIXED_SECRETS)
+    assert host.user_exists("sa-expenses") and host.user_exists("sa-expenses-gw")
+    remove_unit(host, "expenses")
+    assert not host.user_exists("sa-expenses")
+    assert not host.user_exists("sa-expenses-gw")
+
+
+def test_a_retry_after_a_failed_reload_redoes_the_reload(
+    host: System, python_target: Target, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA round 3 #5: an incomplete apply must never be reported as done."""
+    reloads: list[str] = []
+
+    def first_reload_explodes(self: System, caddyfile: str = "/etc/caddy/Caddyfile") -> None:
+        reloads.append(caddyfile)
+        if len(reloads) == 1:
+            raise StepError("reload caddy", "caddy is not running")
+
+    monkeypatch.setattr(System, "caddy_reload", first_reload_explodes)
+    unit = make_unit()
+    with pytest.raises(StepError, match="reload caddy"):
+        apply_unit(host, python_target, unit, FIXED_SECRETS)
+    assert registry.load(host)["expenses"].complete is False
+
+    actions, _ = apply_unit(host, python_target, unit, FIXED_SECRETS)
+    assert len(reloads) == 2, "the retry skipped the reload that failed"
+    assert [a for a in actions if a.verb == "caddy_reload"][0].state == "create"
+    assert registry.load(host)["expenses"].complete is True
+
+    third, _ = apply_unit(host, python_target, unit, FIXED_SECRETS)
+    assert len(reloads) == 2, "a complete unit must not reload again"
+    assert all(action.state == "unchanged" for action in third)
+
+
+def test_removed_static_files_are_undeployed(host: System, static_dir: Path) -> None:
+    """QA round 3 #10: deleting a page from the source must take it off the internet."""
+    (static_dir / "old.txt").write_text("yesterday\n")
+    unit = make_unit(kind="static", name="notes")
+    apply_unit(host, detect(static_dir), unit, FIXED_SECRETS)
+    assert host.path("/opt/smallapp/notes/old.txt").is_file()
+
+    (static_dir / "old.txt").unlink()
+    actions, _ = apply_unit(host, detect(static_dir), unit, FIXED_SECRETS)
+    assert not host.path("/opt/smallapp/notes/old.txt").exists()
+    assert any(a.verb == "rm" and a.target.endswith("old.txt") for a in actions)
+    assert host.path("/opt/smallapp/notes/index.html").is_file()
+
+
+def test_concurrent_first_applies_keep_both_units(tmp_path: Path, app_file: Path) -> None:
+    """QA round 3 #6: without a lock both applies pick a port and one entry is lost."""
+    root = tmp_path / "root"
+    root.mkdir()
+    names = ["alpha", "beta", "gamma", "delta"]
+    barrier = threading.Barrier(len(names))
+
+    def apply_one(name: str) -> subprocess.CompletedProcess[str]:
+        barrier.wait(timeout=30)
+        return run_cli(*apply_args(app_file, name, root))
+
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        results = list(pool.map(apply_one, names))
+
+    for name, result in zip(names, results, strict=True):
+        assert result.returncode == 0, f"{name}: {result.stderr}"
+    units = registry.load(System(root))
+    assert sorted(units) == sorted(names), "a concurrent apply lost a unit"
+    ports = [unit.port for unit in units.values()]
+    assert len(set(ports)) == len(ports), f"duplicate ports allocated: {ports}"

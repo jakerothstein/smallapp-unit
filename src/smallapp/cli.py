@@ -45,10 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("plan", "apply"):
         sub = subs[name]
         sub.add_argument("target", metavar="TARGET", help="a .py file or a dir with index.html")
-        sub.add_argument("--name", required=True, help="unit name, [a-z0-9-], 1-32 chars")
+        sub.add_argument("--name", required=True, help="unit name, [a-z0-9-], 1-26 chars")
         sub.add_argument("--domain", required=True, help="hostname to serve the unit on")
         sub.add_argument("--tls", choices=("acme", "internal"), default="acme")
     subs["plan"].add_argument("--out", metavar="DIR", help="write rendered artifacts into DIR")
+    subs["plan"].add_argument("--root", default="/", help="preview against this prefix")
     subs["apply"].add_argument("--root", default="/", help="apply into this prefix instead of /")
     subs["status"].add_argument("name", metavar="NAME", nargs="?", help="only this unit")
     subs["status"].add_argument("--json", action="store_true", help="machine-readable output")
@@ -60,7 +61,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _unit(system: System, args: argparse.Namespace, target: Target) -> Unit:
+    """Build the unit, inheriting whatever a previous apply already decided.
+
+    `created_at`, `created_user` and `complete` come from the registry when the unit is
+    already known, so a second apply is byte-identical however long it is delayed.
+    """
     name = validate_name(args.name)
+    known = registry.load(system).get(name)
     port, gw_port = registry.allocate_ports(system, name)
     return Unit(
         name=name,
@@ -69,17 +76,21 @@ def _unit(system: System, args: argparse.Namespace, target: Target) -> Unit:
         port=port,
         gw_port=gw_port,
         tls=args.tls,
-        created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        created_at=known.created_at
+        if known is not None
+        else datetime.now(UTC).isoformat(timespec="seconds"),
+        created_user=known.created_user if known is not None else False,
+        complete=known.complete if known is not None else False,
     )
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    system = System("/")
+    system = System(args.root)
     try:
         target = detect(args.target)
         unit = _unit(system, args, target)
         secrets = resolve_secrets(system, unit)
-        actions = build(system, target, unit, secrets)
+        actions = build(system, target, unit, secrets, registry.load(system).get(unit.name))
     except (ValidationError, TargetError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_TARGET
@@ -106,14 +117,21 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return EXIT_FAIL
     try:
         target = detect(args.target)
-        unit = _unit(system, args, target)
-    except (ValidationError, TargetError) as exc:
+    except TargetError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_TARGET
     try:
-        secrets = resolve_secrets(system, unit)
-        actions, token = apply_unit(system, target, unit, secrets)
-    except (StepError, RegistryError, OSError) as exc:
+        # One lock covers allocation through registration: two concurrent applies must
+        # not pick the same port or overwrite each other's registry entry.
+        with system.lock():
+            try:
+                unit = _unit(system, args, target)
+            except ValidationError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_BAD_TARGET
+            secrets = resolve_secrets(system, unit)
+            actions, token = apply_unit(system, target, unit, secrets)
+    except (StepError, RegistryError, ValidationError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_FAIL
     _print_header(unit)
@@ -174,7 +192,8 @@ def cmd_rm(args: argparse.Namespace) -> int:
         print("error: rm needs root; re-run with sudo or use --root DIR", file=sys.stderr)
         return EXIT_FAIL
     try:
-        actions = remove_unit(system, args.name)
+        with system.lock():
+            actions = remove_unit(system, args.name)
     except (StepError, RegistryError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_FAIL
@@ -209,12 +228,15 @@ def _print_header(unit: Unit) -> None:
 
 
 def write_out(files: dict[str, RenderedFile], out: Path) -> int:
-    """Mirror every rendered file under `out`, keeping its absolute path shape."""
+    """Mirror every rendered file under `out`, keeping its absolute path shape.
+
+    Goes through `System`, so `--out` is symlink-confined exactly like `--root`: a
+    symlinked component under DIR is refused, not followed out of it.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    destination = System(out)
     for path, rendered in files.items():
-        destination = out / path.lstrip("/")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(rendered.content)
-        destination.chmod(rendered.mode)
+        destination.write(path, rendered.content, rendered.mode)
     return len(files)
 
 

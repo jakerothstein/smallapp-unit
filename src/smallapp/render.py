@@ -94,8 +94,8 @@ def render(target: Target, unit: Unit, secret: str, token_hash: str) -> dict[str
     files[str(unit.gw_service_path)] = RenderedFile(
         templates.GW_UNIT.format(
             name=unit.name,
-            user=unit.user,
-            app_dir=unit.app_dir,
+            gw_user=unit.gw_user,
+            gw_port=unit.gw_port,
             env_path=unit.env_path,
             gw_exec_start=gw_exec_start(),
             gw_memory_max=GW_MEMORY_MAX,

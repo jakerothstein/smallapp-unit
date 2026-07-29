@@ -7,17 +7,24 @@ laptop. Everything above this module is pure and needs no root to exercise.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import pwd
+import re
 import shutil
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 USERADD = "/usr/sbin/useradd"
+USERDEL = "/usr/sbin/userdel"
+USERDEL_NO_SUCH_USER = 6  # userdel(8): "specified user doesn't exist"
 SYSTEMCTL = "systemctl"
 CADDY = "caddy"
 USER_MARKER_DIR = "var/lib/smallapp/users"
+LOCK_DIR = "/var/lib/smallapp"
 
 
 class StepError(RuntimeError):
@@ -29,17 +36,38 @@ class StepError(RuntimeError):
 
 
 class System:
-    """Filesystem and service operations, optionally confined to a prefix."""
+    """Filesystem and service operations, confined to a prefix and to real directories."""
 
     def __init__(self, root: str | Path = "/") -> None:
         self.root = Path(root).resolve()
         self.prefixed = self.root != Path("/")
 
     def path(self, absolute: str) -> Path:
-        """Map an absolute artifact path into this system's root."""
+        """Map an absolute artifact path into this system's root.
+
+        Under a prefix every component is checked with `lstat`: a symlinked or `..`
+        component is refused rather than followed, so `--root DIR` really confines to
+        DIR. At the real root there is nothing to confine to — and `/etc` is genuinely
+        a symlink on macOS — so only `..` is refused there.
+
+        ponytail: this is a check-then-use, so it is not proof against an attacker who
+        can win a rename race inside the prefix. Everything under the prefix is created
+        by this process; upgrade to openat(O_NOFOLLOW) walks if untrusted users ever
+        get write access to an artifact directory.
+        """
         if not absolute.startswith("/"):
             raise ValueError(f"{absolute!r} is not an absolute path")
-        return self.root / absolute.lstrip("/")
+        target = self.root
+        for part in PurePosixPath(absolute).parts[1:]:
+            if part == "..":
+                raise StepError(f"resolve {absolute}", "path contains '..'")
+            target = target / part
+            if self.prefixed and target.is_symlink():
+                raise StepError(
+                    f"resolve {absolute}",
+                    f"{target} is a symlink; refusing to follow it out of {self.root}",
+                )
+        return target
 
     def read(self, absolute: str) -> bytes | None:
         target = self.path(absolute)
@@ -53,13 +81,36 @@ class System:
             return None
         return target.stat().st_mode & 0o777
 
-    def write(self, absolute: str, content: bytes, mode: int) -> None:
+    def list_files(self, absolute: str) -> list[str]:
+        """Absolute logical paths of every regular file under `absolute`."""
         target = self.path(absolute)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_dir():
+            return []
+        base = absolute.rstrip("/")
+        return sorted(
+            f"{base}/{item.relative_to(target).as_posix()}"
+            for item in target.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        )
+
+    def write(self, absolute: str, content: bytes, mode: int) -> None:
+        """Write atomically. The temporary file is *created* at `mode`, never at 0644:
+        a secret must not exist world-readable for even one scheduling slice."""
+        target = self.path(absolute)
+        self.mkdir_p(target.parent)
         temporary = target.with_name(f".{target.name}.smallapp-tmp")
-        temporary.write_bytes(content)
-        os.chmod(temporary, mode)
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        try:
+            os.fchmod(descriptor, mode)  # umask may not weaken the declared mode
+            os.write(descriptor, content)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, target)
+
+    def mkdir_p(self, target: Path) -> None:
+        target.mkdir(parents=True, exist_ok=True)
 
     def mkdir(self, absolute: str, mode: int = 0o755) -> None:
         target = self.path(absolute)
@@ -79,6 +130,26 @@ class System:
         while target != self.root and target.is_dir() and not any(target.iterdir()):
             target.rmdir()
             target = target.parent
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        """Serialise port allocation through registration across concurrent applies.
+
+        The lock is `flock` on the state directory itself, so it leaves no artifact for
+        `rm` to have to clean up.
+
+        ponytail: `rm` of the last unit prunes that directory, which invalidates the
+        lock for anyone holding it. One box, one operator — give the lock its own
+        never-pruned file if simultaneous rm and apply ever becomes real.
+        """
+        target = self.path(LOCK_DIR)
+        target.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
 
     def user_exists(self, user: str) -> bool:
         if self.prefixed:
@@ -101,12 +172,14 @@ class System:
         )
 
     def delete_user(self, user: str) -> None:
+        """Delete a user smallapp created. An already-absent user is fine; anything
+        else (a live process, a busy home) is a failure the caller must surface."""
         if self.prefixed:
             marker = self.root / USER_MARKER_DIR / user
             if marker.exists():
                 marker.unlink()
             return
-        self._run(f"delete user {user}", ["/usr/sbin/userdel", user], allow_fail=True)
+        self._run(f"delete user {user}", [USERDEL, user], tolerate=(USERDEL_NO_SUCH_USER,))
 
     def chown(self, absolute: str, user: str) -> None:
         """Give `absolute` to `user`. A no-op under a prefix, where there is no such uid."""
@@ -142,20 +215,23 @@ class System:
     def is_root(self) -> bool:
         return os.geteuid() == 0
 
-    def _run(self, step: str, command: list[str], allow_fail: bool = False) -> None:
+    def _run(self, step: str, command: list[str], tolerate: tuple[int, ...] = ()) -> None:
         try:
             result = subprocess.run(  # noqa: S603
                 command, capture_output=True, text=True, check=False
             )
         except OSError as exc:
             raise StepError(step, str(exc)) from exc
-        if result.returncode != 0 and not allow_fail:
+        if result.returncode != 0 and result.returncode not in tolerate:
             detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
             raise StepError(step, detail)
 
 
 CADDYFILE = "/etc/caddy/Caddyfile"
 CADDY_IMPORT = "import smallapp.d/*.caddy"
+CADDY_ADMIN = "admin unix//run/caddy/admin.sock"
+IMPORT_RE = re.compile(r"^import\s+smallapp\.d/\*\.caddy$")
+ADMIN_RE = re.compile(r"^admin\s+(?P<endpoint>\S+)$")
 
 
 @dataclass(frozen=True)
@@ -165,6 +241,35 @@ class Check:
     fix: str
 
 
+def _directives(text: str) -> list[str]:
+    """Active Caddyfile directives: comments and blank lines are not configuration."""
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append(stripped.split(" #")[0].split("\t#")[0].strip())
+    return lines
+
+
+def caddy_imports_smallapp(text: str) -> bool:
+    return any(IMPORT_RE.match(line) for line in _directives(text))
+
+
+def caddy_admin_is_private(text: str) -> bool:
+    """True when the admin API is off or on a unix socket, i.e. not on 127.0.0.1:2019.
+
+    A TCP admin endpoint is reachable by every deployed app, and it can rewrite the
+    whole Caddy config — including deleting a unit's `forward_auth`.
+    """
+    for line in _directives(text):
+        match = ADMIN_RE.match(line)
+        if match:
+            endpoint = match.group("endpoint")
+            return endpoint == "off" or endpoint.startswith("unix/")
+    return False
+
+
 def preflight(system: System) -> list[Check]:
     """Can this host host units? Every failure carries the command that fixes it."""
     checks = [
@@ -172,12 +277,21 @@ def preflight(system: System) -> list[Check]:
         _binary(system, "caddy", "install Caddy: https://caddyserver.com/docs/install"),
         _binary(system, "uv", "install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"),
     ]
-    caddyfile = system.read(CADDYFILE)
+    raw = system.read(CADDYFILE)
+    caddyfile = "" if raw is None else raw.decode("utf-8", "replace")
     checks.append(
         Check(
             f"{CADDYFILE} imports smallapp.d/*.caddy",
-            caddyfile is not None and CADDY_IMPORT in caddyfile.decode("utf-8", "replace"),
+            raw is not None and caddy_imports_smallapp(caddyfile),
             f"add a line `{CADDY_IMPORT}` to {CADDYFILE}, then: caddy reload",
+        )
+    )
+    checks.append(
+        Check(
+            "caddy admin API is off the network",
+            raw is not None and caddy_admin_is_private(caddyfile),
+            f"put `{{ {CADDY_ADMIN} }}` at the top of {CADDYFILE} so deployed apps "
+            "cannot reach it on 127.0.0.1:2019, then: systemctl restart caddy",
         )
     )
     checks.append(

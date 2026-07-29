@@ -13,7 +13,8 @@ smallapp apply ./expenses.py --name expenses --domain expenses.example.com
 
 That gives you, on the host:
 
-- a dedicated unprivileged unix user, `sa-expenses`
+- two dedicated unprivileged unix users, `sa-expenses` for the app and
+  `sa-expenses-gw` for its gateway, so the app cannot read the gateway's secret
 - a **hardened** systemd service (`ProtectSystem=strict`, `NoNewPrivileges`, syscall
   filter, memory cap) so unaudited agent-written code cannot read the rest of the box
 - a Caddy vhost with free automatic TLS from Let's Encrypt
@@ -25,8 +26,11 @@ That gives you, on the host:
 
 - **Your laptop:** Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 - **The host:** Debian or Ubuntu with systemd, [Caddy](https://caddyserver.com), and
-  `uv`. A DNS A record pointing your domain at it. Ports 80 and 443 open.
-  `smallapp doctor` checks all of this and names the command that fixes each gap.
+  `uv`. `smallapp doctor` checks exactly those four things — systemd, Caddy plus its
+  `smallapp.d` import and a non-network admin API, `uv`, and root — and names the
+  command that fixes each gap.
+- **You:** a DNS A record pointing your domain at the host, and ports 80 and 443 open.
+  `doctor` does not check these; if TLS never issues, check them first.
 
 ## Quickstart
 
@@ -44,18 +48,25 @@ apt update && apt install -y caddy
 curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 ```
 
-Tell Caddy to pick up smallapp vhosts, then reload it:
+Tell Caddy to pick up smallapp vhosts, and move its admin API off the network so a
+deployed app cannot reach it on `127.0.0.1:2019` and rewrite your config:
 
 ```sh
 mkdir -p /etc/caddy/smallapp.d
-echo 'import smallapp.d/*.caddy' >> /etc/caddy/Caddyfile
-caddy reload --config /etc/caddy/Caddyfile
+printf '{\n    admin unix//run/caddy/admin.sock\n}\n\nimport smallapp.d/*.caddy\n' \
+  >> /etc/caddy/Caddyfile
+systemctl restart caddy
 ```
 
-Install smallapp itself:
+Install smallapp itself. The two `UV_` variables matter: generated services run with
+`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin` as an unprivileged user,
+so both the executable and the tool environment must live in system paths, not under
+`/root`.
 
 ```sh
-uv tool install --from git+https://github.com/smallapp/unit smallapp-unit
+UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/usr/local/bin \
+  uv tool install --from git+https://github.com/jakerothstein/smallapp-unit smallapp-unit
+chmod -R a+rX /opt/uv/tools
 ```
 
 Confirm the host is ready — this exits 0 or tells you exactly what to fix:
@@ -155,17 +166,33 @@ A static target is a directory containing `index.html`. That is the whole contra
 
 | Artifact | Path |
 | --- | --- |
-| unix user | `sa-NAME` |
+| unix users | `sa-NAME` (the app), `sa-NAME-gw` (the gateway) |
 | app payload | `/opt/smallapp/NAME/` |
-| writable state | `/var/lib/smallapp/NAME/` |
+| writable state | `/var/lib/smallapp/NAME/`, `/var/lib/smallapp/NAME-gw/` |
 | secrets (0600) | `/etc/smallapp/NAME.env` |
 | services | `/etc/systemd/system/smallapp-NAME[-gw].service` |
 | vhost | `/etc/caddy/smallapp.d/NAME.caddy` |
 | registry | `/var/lib/smallapp/registry.json` |
 
 The app service never sees the session secret or the token hash: only the gateway
-reads `/etc/smallapp/NAME.env`. Re-running `apply` reuses the secrets already on disk,
-so a second run reports `no changes` and does not print a new token.
+reads `/etc/smallapp/NAME.env`, and it does so under **its own uid**, so app code
+cannot read the gateway's `/proc/PID/environ` and lift the cookie key out of it.
+Re-running `apply` reuses the secrets already on disk, so a second run reports
+`no changes` and does not print a new token.
+
+## What is and is not isolated
+
+Each unit is confined by systemd: no capabilities, a syscall filter, a read-only
+filesystem apart from its own state directory, a memory cap, and a uid of its own. An
+app can only bind its own port (`SocketBindDeny=any`), cannot see other users'
+processes (`ProtectProc=invisible`), and cannot reach Caddy's admin API once that is
+on a unix socket as the quickstart sets up.
+
+What is **not** isolated: apps share the host's loopback interface, so a deployed app
+can open a TCP connection to another unit's `127.0.0.1:18xxx` port. The auth boundary
+is the gateway in front of each app, not the network between them. Closing that gap
+needs per-cgroup packet filtering, and firewall management is an explicit non-goal —
+if you deploy code you do not trust *at all*, give it its own box.
 
 ## Development
 

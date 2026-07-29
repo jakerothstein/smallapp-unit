@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -74,3 +76,57 @@ def test_port_substring_does_not_count(tmp_path: Path) -> None:
     app.write_text("SUPPORTED = 1\n")
     with pytest.raises(TargetError, match="PORT"):
         detect(app)
+
+
+PORT_FALSE_POSITIVES = [
+    pytest.param("# PORT\nprint('not a server')\n", id="comment"),
+    pytest.param('print("not a server: PORT")\n', id="string-literal"),
+    pytest.param('"""A docstring mentioning PORT."""\n', id="docstring"),
+    pytest.param("PORT = 8080\nprint(PORT)\n", id="local-variable"),
+    pytest.param("class PORT:\n    pass\n", id="class-name"),
+    pytest.param('import os\nos.environ["PORTAL"]\n', id="different-variable"),
+]
+
+PORT_REAL_READS = [
+    pytest.param('import os\nport = int(os.environ["PORT"])\n', id="subscript"),
+    pytest.param('import os\nport = os.environ.get("PORT", "8080")\n', id="environ-get"),
+    pytest.param('import os\nport = os.getenv("PORT")\n', id="os-getenv"),
+    pytest.param('from os import environ\nport = environ["PORT"]\n', id="imported-environ"),
+    pytest.param('from os import getenv\nport = getenv("PORT")\n', id="imported-getenv"),
+]
+
+
+@pytest.mark.parametrize("source", PORT_FALSE_POSITIVES)
+def test_mentioning_port_is_not_reading_it(tmp_path: Path, source: str) -> None:
+    """QA round 3 #11: a comment or a string is not an environment variable read."""
+    app = tmp_path / "app.py"
+    app.write_text(source)
+    with pytest.raises(TargetError, match="PORT"):
+        detect(app)
+
+
+@pytest.mark.parametrize("source", PORT_REAL_READS)
+def test_every_real_way_of_reading_port_is_accepted(tmp_path: Path, source: str) -> None:
+    app = tmp_path / "app.py"
+    app.write_text(source)
+    assert detect(app).kind == "python"
+
+
+def test_unparseable_python_is_rejected_with_its_line(tmp_path: Path) -> None:
+    app = tmp_path / "app.py"
+    app.write_text('import os\ndef (:\nos.environ["PORT"]\n')
+    with pytest.raises(TargetError, match="not valid Python"):
+        detect(app)
+
+
+def test_plan_exits_2_on_a_comment_only_port(tmp_path: Path) -> None:
+    app = tmp_path / "app.py"
+    app.write_text('# PORT\nprint("not a server")\n')
+    result = subprocess.run(
+        [sys.executable, "-m", "smallapp", "plan", str(app), "--name", "x", "--domain", "x.io"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout
+    assert "PORT" in result.stderr

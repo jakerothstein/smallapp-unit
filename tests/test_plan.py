@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from conftest import FIXED_SECRETS, make_unit
+from smallapp import registry
 from smallapp.apply import apply_unit
 from smallapp.plan import build, resolve_secrets, summarise
 from smallapp.system import System
@@ -19,7 +20,7 @@ def test_everything_is_create_against_an_empty_host(host: System, python_target:
 def test_everything_is_unchanged_after_apply(host: System, python_target: Target) -> None:
     unit = make_unit()
     apply_unit(host, python_target, unit, FIXED_SECRETS)
-    actions = build(host, python_target, unit, FIXED_SECRETS)
+    actions = build(host, python_target, unit, FIXED_SECRETS, registry.load(host).get(unit.name))
     assert {action.state for action in actions} == {"unchanged"}
     assert summarise(actions).endswith("no changes.")
 
@@ -28,7 +29,7 @@ def test_a_touched_file_is_reported_as_change(host: System, python_target: Targe
     unit = make_unit()
     apply_unit(host, python_target, unit, FIXED_SECRETS)
     host.write(str(unit.vhost_path), b"tampered\n", 0o644)
-    actions = build(host, python_target, unit, FIXED_SECRETS)
+    actions = build(host, python_target, unit, FIXED_SECRETS, registry.load(host).get(unit.name))
     states = {action.target: action.state for action in actions}
     assert states[str(unit.vhost_path)] == "change"
     assert states["caddy"] == "create"
@@ -38,7 +39,7 @@ def test_a_wrong_mode_is_reported_as_change(host: System, python_target: Target)
     unit = make_unit()
     apply_unit(host, python_target, unit, FIXED_SECRETS)
     host.path(str(unit.env_path)).chmod(0o644)
-    actions = build(host, python_target, unit, FIXED_SECRETS)
+    actions = build(host, python_target, unit, FIXED_SECRETS, registry.load(host).get(unit.name))
     states = {action.target: action.state for action in actions}
     assert states[str(unit.env_path)] == "change"
 

@@ -19,6 +19,7 @@ Requires `uv` (https://docs.astral.sh/uv/) and Python >= 3.11. No other setup.
 | Test | `uv run pytest` |
 | Test (one file) | `uv run pytest tests/test_gateway.py` |
 | Test (fast only) | `uv run pytest -m "not slow"` (skips the subprocess e2e tests) |
+| Test (slow only) | `uv run pytest -m slow` (real subprocesses; one needs network) |
 | Refresh golden files | `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py` |
 | Deploy into a prefix | `uv run smallapp apply APP.py --name n --domain n.example.com --root /tmp/h` |
 | Lint | `uv run ruff check .` |
@@ -68,6 +69,19 @@ Use `--root DIR` to apply into a prefix without root. That is how the end-to-end
 works, and it is the only supported way to test apply on a laptop. Under a prefix,
 `useradd`, `systemctl` and `caddy reload` become no-ops and users are recorded as
 marker files in `<root>/var/lib/smallapp/users/`.
+
+## Facts the loop keeps re-learning
+
+- Unit names are **1-26 chars**: `sa-NAME-gw` must fit the 32-char unix username limit.
+- Every unit gets **two** users (`sa-NAME`, `sa-NAME-gw`) and **two** state dirs
+  (`/var/lib/smallapp/NAME`, `/var/lib/smallapp/NAME-gw`). They must never share one.
+- Caddy's admin API must be on a unix socket (`admin unix//run/caddy/admin.sock`);
+  `smallapp doctor` fails the host otherwise. Reloads go through that socket.
+- The documented install is
+  `UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ...`
+  followed by `chmod -R a+rX /opt/uv/tools`. The gateway runs as `sa-NAME-gw`, so
+  anything under `/root` is unreachable to it.
+- `python` is not on PATH here. Always `uv run python`.
 
 `systemd-analyze security` (criterion 26) has only ever skipped on macOS. On a Linux
 box run `uv run pytest tests/test_hardening.py` and confirm it does not skip.

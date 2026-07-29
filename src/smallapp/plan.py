@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .naming import Unit
+from .naming import Unit, ValidationError
 from .render import RenderedFile, render
 from .system import System
 from .target import Target
@@ -68,18 +68,27 @@ def file_state(system: System, path: str, rendered: RenderedFile) -> State:
     return "change"
 
 
-def build(system: System, target: Target, unit: Unit, secrets: Secrets) -> list[Action]:
-    """The full ordered plan for one unit against the current state of `system`."""
+def build(
+    system: System, target: Target, unit: Unit, secrets: Secrets, known: Unit | None = None
+) -> list[Action]:
+    """The full ordered plan for one unit against the current state of `system`.
+
+    `known` is the unit's registry entry, or None if it has never been applied. It is
+    what tells an adopted unix user from one smallapp made, and an interrupted apply
+    from a finished one.
+    """
     files = render(target, unit, secrets.secret, secrets.token_hash)
-    actions: list[Action] = [
-        Action(
-            "user",
-            unit.user,
-            {},
-            "unchanged" if system.user_exists(unit.user) else "create",
-        )
-    ]
-    for directory in (str(unit.app_dir), str(unit.state_dir)):
+    actions: list[Action] = []
+    for user in (unit.user, unit.gw_user):
+        exists = system.user_exists(user)
+        if exists and known is None:
+            raise ValidationError(
+                f"unix user {user!r} already exists but smallapp did not create it. "
+                f"Refusing to adopt an account whose shell, home and uid are unknown "
+                f"— remove it, or deploy under a different --name."
+            )
+        actions.append(Action("user", user, {}, "unchanged" if exists else "create"))
+    for directory in (str(unit.app_dir), str(unit.state_dir), str(unit.gw_state_dir)):
         exists = system.path(directory).is_dir()
         actions.append(Action("mkdir", directory, {}, "unchanged" if exists else "create"))
     for path in sorted(files):
@@ -92,21 +101,32 @@ def build(system: System, target: Target, unit: Unit, secrets: Secrets) -> list[
                 file_state(system, path, rendered),
             )
         )
-    actions.append(
-        Action(
-            "chown",
-            str(unit.state_dir),
-            {"user": unit.user},
-            "unchanged" if system.path(str(unit.state_dir)).is_dir() else "create",
+    for stale in stale_payload(system, unit, files):
+        actions.append(Action("rm", stale, {}, "change"))
+    owned = ((str(unit.state_dir), unit.user), (str(unit.gw_state_dir), unit.gw_user))
+    for directory, owner in owned:
+        actions.append(
+            Action(
+                "chown",
+                directory,
+                {"user": owner},
+                "unchanged" if system.path(directory).is_dir() else "create",
+            )
         )
-    )
     changed = any(action.state != "unchanged" for action in actions)
-    service_state: State = "create" if changed else "unchanged"
+    incomplete = known is None or not known.complete
+    service_state: State = "create" if changed or incomplete else "unchanged"
     actions.append(Action("systemctl", "daemon-reload", {"verb": "daemon-reload"}, service_state))
     for service in (unit.service_path.name, unit.gw_service_path.name):
         actions.append(Action("systemctl", service, {"verb": "enable --now"}, service_state))
     actions.append(Action("caddy_reload", "caddy", {}, service_state))
     return actions
+
+
+def stale_payload(system: System, unit: Unit, files: dict[str, RenderedFile]) -> list[str]:
+    """Deployed payload files the new target no longer contains. Removing a file from
+    a static site must un-deploy it, or yesterday's page stays on the internet."""
+    return [path for path in system.list_files(str(unit.app_dir)) if path not in files]
 
 
 def summarise(actions: list[Action]) -> str:

@@ -10,6 +10,7 @@ import pytest
 
 from smallapp import COMMANDS
 from smallapp.cli import build_parser, main
+from smallapp.system import CADDY_ADMIN, CADDY_IMPORT, CADDYFILE
 
 
 def test_help_lists_every_command(capsys: pytest.CaptureFixture[str]) -> None:
@@ -80,7 +81,65 @@ def test_plan_rejects_hostile_name(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     app = tmp_path / "app.py"
-    app.write_text("import os\nPORT\n")
+    app.write_text('import os\nos.environ["PORT"]\n')
     code = main(["plan", str(app), "--name", "Bad Name", "--domain", "x.example.com"])
     assert code == 2
     assert "Bad Name" in capsys.readouterr().err
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "smallapp", *args], capture_output=True, text=True, check=False
+    )
+
+
+def test_doctor_through_the_cli_fails_on_a_bare_root(tmp_path: pathlib.Path) -> None:
+    """QA round 2 #10: criterion 24 is about the command, so drive the command."""
+    result = run_cli("doctor", "--root", str(tmp_path))
+    assert result.returncode == 1
+    for missing in ("systemctl present", "caddy present", "uv present", "imports smallapp.d"):
+        assert missing in result.stderr
+    assert "fix:" in result.stderr
+
+
+def test_doctor_through_the_cli_passes_on_a_prepared_root(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "usr/bin").mkdir(parents=True)
+    for program in ("systemctl", "caddy", "uv"):
+        (tmp_path / "usr/bin" / program).write_text("#!/bin/sh\n")
+    caddyfile = tmp_path / CADDYFILE.lstrip("/")
+    caddyfile.parent.mkdir(parents=True)
+    caddyfile.write_text(f"{{\n    {CADDY_ADMIN}\n}}\n\n{CADDY_IMPORT}\n")
+    result = run_cli("doctor", "--root", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "this host can host smallapp units." in result.stdout
+
+
+def test_plan_previews_against_the_prefix_it_is_given(
+    tmp_path: pathlib.Path, app_file: pathlib.Path
+) -> None:
+    """`plan` reads registry and disk state, so it needs the same `--root` as `apply`;
+    without it a prefixed deploy could only ever be previewed against the real host."""
+    root = tmp_path / "root"
+    root.mkdir()
+    args = (
+        str(app_file),
+        "--name",
+        "preview",
+        "--domain",
+        "preview.example.com",
+        "--tls",
+        "internal",
+        "--root",
+        str(root),
+    )
+    before = run_cli("plan", *args)
+    assert before.returncode == 0, before.stderr
+    assert "no changes" not in before.stdout
+
+    applied = run_cli("apply", *args)
+    assert applied.returncode == 0, applied.stderr
+
+    after = run_cli("plan", *args)
+    assert after.returncode == 0, after.stderr
+    assert "no changes" in after.stdout, after.stdout
+    assert "+ " not in after.stdout, "a second plan wants to redo work that is already done"

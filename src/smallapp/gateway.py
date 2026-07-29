@@ -152,7 +152,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._login_form(200)
         elif path == LOGOUT_PATH:
-            self._logout()
+            if self.command == "POST":
+                self._logout()
+            else:
+                self._method_not_allowed("POST")
         elif path.startswith(f"{PREFIX}/"):
             self._send(404, b"not found", "text/plain; charset=utf-8")
         else:
@@ -227,6 +230,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _method_not_allowed(self, allowed: str) -> None:
+        """Outside the documented contract: refuse, and touch no cookie doing it."""
+        body = f"method not allowed; use {allowed}".encode()
+        self.send_response(405)
+        self.send_header("Allow", allowed)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self._write(body)
 
     def _content_length(self) -> int | None:
         raw = self.headers.get("Content-Length", "0")

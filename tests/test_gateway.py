@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import inspect
 import subprocess
@@ -247,9 +248,39 @@ def test_gateway_exits_fast_naming_the_missing_var(missing: str) -> None:
     assert time.monotonic() - started < 2.0
 
 
+def test_login_really_reaches_compare_digest(gw: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """QA round 2 #9: source text proves nothing. Watch the real call happen."""
+    calls: list[int] = []
+    real = hmac.compare_digest
+
+    def spy(a: str, b: str) -> bool:
+        calls.append(1)
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    status, headers, _ = request(gw, "POST", "/_smallapp/login", form={"token": "wrong"})
+    assert status == 401
+    assert "Set-Cookie" not in headers
+    assert calls, "a wrong-token login did not reach hmac.compare_digest"
+
+    calls.clear()
+    status, _, _ = request(gw, "POST", "/_smallapp/login", form={"token": TOKEN})
+    assert status == 303
+    assert calls, "a correct-token login did not reach hmac.compare_digest"
+
+
 def test_gateway_and_tokens_compare_secrets_constant_time() -> None:
-    for module in (gateway, tokens):
-        source = inspect.getsource(module)
-        assert "hmac.compare_digest" in source or "verify_token" in source
     assert "compare_digest" in inspect.getsource(tokens)
     assert "==" not in inspect.getsource(gateway.Handler._login)
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "PATCH", "DELETE"])
+def test_logout_outside_the_contract_is_405_and_touches_no_cookie(gw: int, method: str) -> None:
+    """QA round 3 #15: only POST /_smallapp/logout is in the HTTP contract."""
+    cookie = sign_cookie(SECRET)
+    status, headers, _ = request(gw, method, "/_smallapp/logout", cookie=cookie)
+    assert status == 405
+    assert headers["Allow"] == "POST"
+    assert "Set-Cookie" not in headers
+    # The session survives a method that was refused.
+    assert request(gw, "GET", "/_smallapp/auth", cookie=cookie)[0] == 204
