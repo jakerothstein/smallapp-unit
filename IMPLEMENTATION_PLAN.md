@@ -1,3 +1,77 @@
+## QA FINDINGS (round 2, 2026-07-29)
+
+1. **HIGH — delayed re-apply mutates state while reporting no changes.**
+   `src/smallapp/cli.py:72` regenerates `created_at`, and
+   `src/smallapp/apply.py:54` always rewrites the registry. Apply a unit, wait two
+   seconds, hash `var/lib/smallapp/registry.json`, and apply again: stdout says
+   `13 unchanged. no changes.` but the hash changes. Fixed means preserving the
+   original timestamp and testing a delayed, byte-identical CLI re-apply.
+
+2. **HIGH — the documented install source and generated documentation URL do not
+   exist.** `README.md:58` and `src/smallapp/templates.py:47` point to
+   `https://github.com/smallapp/unit`. From a clean home,
+   `uv tool install --from git+https://github.com/smallapp/unit smallapp-unit` fails
+   to fetch. Fixed means using the canonical repository URL in both places and
+   executing the documented install in an automated clean-host check.
+
+3. **HIGH — the documented install is not executable by generated services.**
+   `README.md:58`, `src/smallapp/render.py:55-56`, and
+   `src/smallapp/templates.py:81` install into root's user-local tool directory but
+   render `ExecStart=/usr/bin/env smallapp gateway`. Reproduce with a clean `HOME`:
+   `uv tool install` places the binary under `.local/bin`, outside the service PATH
+   and inaccessible to `sa-NAME`. Fixed means installing tool and executable in
+   service-readable system paths and starting the rendered command in a test.
+
+4. **MEDIUM — comments and strings satisfy Python target validation.**
+   `src/smallapp/target.py:12,56-66` searches raw source for `PORT`. A file containing
+   `# PORT` and `print("not a server")` makes `smallapp plan` exit 0. Fixed means
+   comments and string literals do not count as reading the environment variable,
+   with regression tests for both.
+
+5. **MEDIUM — doctor accepts a commented-out Caddy import.**
+   `src/smallapp/system.py:175-180` uses substring membership. Put only
+   `# import smallapp.d/*.caddy` in the Caddyfile; doctor reports the import check as
+   OK. Fixed means recognizing an active import directive and rejecting commented or
+   otherwise inactive text.
+
+6. **MEDIUM — removal hides unix-user deletion failure.**
+   `src/smallapp/system.py:103-109` invokes `userdel` with `allow_fail=True`, while
+   `src/smallapp/apply.py:78-86` still reports success. On Linux, keep a process alive
+   as `sa-NAME` and run `smallapp rm NAME`; the user remains. Fixed means naming the
+   failed step and exiting non-zero on unexpected `userdel` failure.
+
+7. **LOW — logout accepts methods outside the specified contract.**
+   `src/smallapp/gateway.py:145-155,221-229` expires the cookie for every method.
+   `GET /_smallapp/logout` returns 303 with `Max-Age=0`. Fixed means non-POST requests
+   return 405 without changing cookies, covered by a method-contract test.
+
+8. **MEDIUM — the plan secret-leak test is vacuous.**
+   `tests/test_apply.py:154-171` reads secrets from a temporary `--root`, then plans
+   against `/`, which generates unrelated values. An implementation that prints its
+   own rendered secret still passes. Fixed means using `plan --out`, reading that
+   invocation's env file, and asserting its exact secret and token hash are absent
+   from stdout and stderr.
+
+9. **LOW — the constant-time guard is a source-text tautology.**
+   `tests/test_gateway.py:250-255` passes when `verify_token` merely appears in
+   `gateway.py`. It does not prove login reaches `hmac.compare_digest`. Fixed means
+   spying on `hmac.compare_digest` during a real login attempt and asserting the call.
+
+10. **LOW — criterion 24 is not tested through the CLI.**
+    `tests/test_system.py:99-118` calls `preflight()` directly. No test runs
+    `smallapp doctor --root` against bare and prepared prefixes. Fixed means a
+    subprocess test asserts exit 1 plus diagnostics for the former and exit 0 for the
+    latter.
+
+11. **MEDIUM — secret env files are briefly created world-readable.**
+    `src/smallapp/system.py:59-62` calls `Path.write_bytes()` before `chmod(0600)`.
+    With root's usual umask, `/etc/smallapp/.NAME.env.smallapp-tmp` is initially 0644;
+    an unprivileged local process watching the traversable directory can open it and
+    steal the HMAC secret before chmod, then forge an owner cookie. Fixed means
+    atomically creating the temporary file with the final restrictive mode (for
+    example, `os.open(..., mode=0o600)`) before writing, with a test asserting mode at
+    creation time.
+
 ## QA FINDINGS (round 1, 2026-07-29)
 
 1. **HIGH — a delayed second apply mutates state while reporting no changes.**
