@@ -26,24 +26,10 @@ their tests. — closes (4), (5), (6), part of (7), (25), (16), (17), half of (2
 them. Regenerate goldens with `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py`.
 — closes (8), (9), (10).
 
-## 6. Registry
+## 6-8. Registry, System seam, plan, apply, rm, doctor (done)
 
-`registry.py`: JSON read/write with atomic replace, unit records, port collision
-probing. Wire into `plan`/`status`.
-— closes rest of (7), (23).
-
-## 7. Plan + System seam
-
-`system.py` (root-prefix-aware write/chmod/chown/user/systemctl/caddy_reload) and
-`plan.py` (rendered files + current fs → ordered actions with create/change/unchanged
-state). `smallapp plan` prints the real action list.
-— closes (11).
-
-## 8. Apply and rm
-
-`apply.py`: execute actions, print `+ ~ =`, print the one-time token, fail loudly
-naming the failing step. `smallapp rm` reverses everything.
-— closes (12), (13), (14), (15).
+`registry.py`, `system.py` (incl. `preflight` for doctor), `plan.py`, `apply.py`, and
+the full CLI. — closes (7), (11), (12), (13), (14), (15), (23), (24 partly).
 
 ## 9. End to end
 
@@ -73,5 +59,10 @@ bare VPS to private URL.
   `uv run --script`. That is what keeps the e2e test offline.
 - The app unit gets `Environment=PORT=`, never the env file: secrets stay with the
   gateway.
+- `doctor`'s checks live in `system.py` (`preflight`), not a separate module: they are
+  host inspection, which is that module's job.
+- Under `--root DIR` the user database is a marker file per user in
+  `var/lib/smallapp/users/`; that is what makes `plan` report `unchanged` on a second
+  run without root.
 - Real-host verification (a live VPS with Caddy and systemd) is a manual step
   documented in the README, not a test. Criterion 26 is the automated stand-in.

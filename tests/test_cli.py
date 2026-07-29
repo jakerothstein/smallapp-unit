@@ -23,9 +23,8 @@ def test_help_lists_every_command(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_every_command_is_reachable() -> None:
     parser = build_parser()
-    extra = {
-        "plan": ["t.py", "--name", "x", "--domain", "x.example.com"],
-    }
+    target_args = ["t.py", "--name", "x", "--domain", "x.example.com"]
+    extra = {"plan": target_args, "apply": target_args, "rm": ["x"]}
     for command in COMMANDS:
         args = parser.parse_args([command, *extra.get(command, [])])
         assert args.command == command
