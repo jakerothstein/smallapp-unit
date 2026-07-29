@@ -1,5 +1,75 @@
 # Implementation plan
 
+## QA FINDINGS (round 4, 2026-07-29)
+
+### 1. HIGH — Python apps can bypass Caddy authentication by binding publicly
+
+- **File:** `src/smallapp/templates.py:64-65`
+- **Reproduce:** Deploy a valid target that reads `PORT` but listens on
+  `0.0.0.0:$PORT`, then request `http://HOST:18xxx/` directly without a cookie.
+  `SocketBindAllow=tcp:PORT` permits every local address, so the request reaches the
+  app whenever that port is network-reachable.
+- **Fixed:** The service must enforce loopback-only reachability independently of
+  untrusted app code; a target choosing `0.0.0.0` or `::` cannot expose the app port.
+
+### 2. HIGH — Every app can read every other unit's payload
+
+- **File:** `src/smallapp/render.py:21,114-120`,
+  `src/smallapp/system.py:115-118`
+- **Reproduce:** Deploy `victim`, then run
+  `runuser -u sa-attacker -- cat /opt/smallapp/victim/app.py` (or
+  `index.html`). Payload directories are `0755` and files are `0644`, despite the
+  threat-model guarantee that an app cannot read another unit's files.
+- **Fixed:** Each app UID can read only its own payload. Static content must grant
+  Caddy access without granting all app UIDs access (for example, a per-unit group or
+  ACL); Python source needs no cross-unit reader.
+
+### 3. MEDIUM — A failed removal cannot be retried
+
+- **File:** `src/smallapp/apply.py:102-104`
+- **Reproduce:** Apply a unit, make `System.caddy_reload()` raise during
+  `remove_unit()`, then retry `rm`. The first call drops the registry entry before the
+  reload; `registry.load()` is empty and the retry returns `not found`.
+- **Fixed:** Keep retry state until daemon-reload and Caddy reload succeed, so the
+  same `rm` command completes all remaining cleanup after a transient failure.
+
+### 4. MEDIUM — `rm` deletes empty directories it did not create
+
+- **File:** `src/smallapp/apply.py:77-79,106-107`,
+  `src/smallapp/system.py:127-132`
+- **Reproduce:** In a prefixed root, pre-create an empty
+  `etc/caddy/smallapp.d`, then run `smallapp rm ghost --root ROOT`. The command says
+  `not found, nothing to do` but deletes that directory. A pre-existing empty
+  `opt/smallapp` can also cause its empty parent chain to be removed.
+- **Fixed:** Unknown-unit removal changes nothing, and known-unit removal prunes only
+  directories smallapp can prove it created.
+
+### 5. MEDIUM — PORT validation accepts fake reads and rejects a valid read
+
+- **File:** `src/smallapp/target.py:64-73`
+- **Reproduce:** `reads_port('Fake().getenv("PORT")')` returns `True`, while
+  `reads_port('import os\nos.getenv(key="PORT")')` returns `False`.
+- **Fixed:** Accept supported positional and keyword reads from actual `os` environment
+  APIs, and reject unrelated methods merely named `getenv`.
+
+### 6. LOW — `plan --out` exposes a Python traceback for filesystem errors
+
+- **File:** `src/smallapp/cli.py:104-107`
+- **Reproduce:** Run
+  `smallapp plan SITE --name x --domain x.example.com --out README.md`, where
+  `README.md` is a file. It exits 1 with an uncaught `FileExistsError` traceback.
+- **Fixed:** Report a concise CLI error naming the output path and exit 1 without a
+  traceback.
+
+### 7. LOW — Invalid `apply` targets use the wrong documented exit code
+
+- **File:** `src/smallapp/cli.py:118-122`
+- **Reproduce:** Run
+  `smallapp apply /nonexistent --name x --domain x.example.com --root ROOT`; it exits
+  2, while the `apply` contract says every failure exits 1.
+- **Fixed:** Invalid `apply` targets exit 1; exit 2 remains specific to invalid
+  `plan` targets.
+
 Ordered vertical slices. Each ends with `uv run pytest && uv run ruff check . && uv run mypy src tests`
 green. Numbers in parentheses are the acceptance criteria from `specs/smallapp-unit.md`
 that the slice closes. Do not start a slice before the one above it is green.
