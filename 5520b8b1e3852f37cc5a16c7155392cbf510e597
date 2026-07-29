@@ -1,0 +1,15 @@
+Loop notes:
+- Slices 1-10 of IMPLEMENTATION_PLAN are complete; every acceptance criterion in the
+  spec is covered by a test.
+- Idempotence hinges on resolve_secrets() reading /etc/smallapp/NAME.env back rather
+  than regenerating; without that, apply #2 rewrites the env file and prints a second
+  token.
+- Static units deliberately get BOTH a file_server vhost (Caddy serves bytes) and an
+  app service running python3 -m http.server. The service is what gives the gateway an
+  upstream in the e2e test and keeps status/restart uniform. Spec amended to say so.
+- systemd hardening was written to score <4.0 but has never been measured: this
+  machine is macOS. First Linux run of tests/test_hardening.py is the real check.
+- e2e substitutes only the port numbers and prefixes /opt/smallapp paths; the ExecStart
+  strings and env file are used as rendered.
+- Spec amendments this loop: status/doctor take --root (tests need it), doctor lives in
+  system.preflight, Unit lives in naming.py, static-unit service documented.
