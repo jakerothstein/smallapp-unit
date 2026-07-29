@@ -31,19 +31,15 @@ them. Regenerate goldens with `UPDATE_GOLDEN=1 uv run pytest tests/test_render.p
 `registry.py`, `system.py` (incl. `preflight` for doctor), `plan.py`, `apply.py`, and
 the full CLI. — closes (7), (11), (12), (13), (14), (15), (23), (24 partly).
 
-## 9. End to end
+## 9-10. End to end, doctor, hygiene (done)
 
-`test_e2e.py`: apply into a temp root, launch the rendered app and gateway as real
-subprocesses from the rendered env file, walk the full login path, then the static
-variant. Fix whatever this finds — it will find something.
-— closes (21), (22).
+`test_e2e.py` (python + static, real subprocesses, real login), `test_hardening.py`
+(skips off Linux with an explicit reason), `test_hygiene.py`, README quickstart.
+— closes (21), (22), (24), (26), (27), (28), (1).
 
-## 10. Doctor + hygiene
+## Open items
 
-`doctor` checks; `test_hardening.py` with `systemd-analyze security` (skip with a
-reason off Linux); no-TODO test; README command-parse test; README quickstart from
-bare VPS to private URL.
-— closes (24), (26), (27), (28), and (1) fully.
+None. Every acceptance criterion in `specs/smallapp-unit.md` is covered by a test.
 
 ## Notes for later loops
 
@@ -64,5 +60,9 @@ bare VPS to private URL.
 - Under `--root DIR` the user database is a marker file per user in
   `var/lib/smallapp/users/`; that is what makes `plan` report `unchanged` on a second
   run without root.
+- Criterion 26 has never run on this machine (macOS); the first Linux CI run is the
+  real check on the hardening score.
+- e2e overrides only the two port numbers (a test may not assume a fixed port is
+  free); everything else comes from the rendered unit and the rendered env file.
 - Real-host verification (a live VPS with Caddy and systemd) is a manual step
   documented in the README, not a test. Criterion 26 is the automated stand-in.

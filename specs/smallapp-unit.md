@@ -128,7 +128,7 @@ login token (shown once): 8f3c2a7e91b4d6...
   open https://expenses.example.com and paste it to sign in
 ```
 
-### `smallapp status [NAME] [--json]`
+### `smallapp status [NAME] [--json] [--root /]`
 
 Reads the registry; per unit prints name, kind, port, domain, and `systemctl
 is-active` for both services.
@@ -160,9 +160,9 @@ HTTP contract:
 Cookie value is `v1.<b64 sub>.<exp>.<b64 hmac-sha256>`; any tamper, any expiry in the
 past, any wrong version prefix fails closed.
 
-### `smallapp doctor`
+### `smallapp doctor [--root /]`
 
-Host preflight: systemd present, Caddy present and its Caddyfile imports
+Host preflight (implemented as `system.preflight`): systemd present, Caddy present and its Caddyfile imports
 `smallapp.d/*.caddy`, `uv` present, running as root. Exit 0 if the host can host;
 exit 1 listing each failed check and the exact command to fix it.
 
@@ -186,15 +186,18 @@ src/smallapp/
   plan.py          rendered files + current filesystem -> ordered list[Action]
   apply.py         execute Actions through a System (root-prefix aware)
   system.py        thin seam over os/subprocess: write, chown, useradd, systemctl,
-                   caddy reload. One real impl; a --root prefix makes it testable.
+                   caddy reload, and the doctor preflight checks. One real impl;
+                   a --root prefix makes it testable.
   registry.py      /var/lib/smallapp/registry.json read/write, port collisions
   gateway.py       stdlib HTTP auth gateway (own module, own test, no CLI coupling)
   tokens.py        secret generation, token hashing, cookie sign/verify (hmac+secrets)
 tests/
   test_target.py test_naming.py test_render.py test_plan.py test_apply.py
-  test_registry.py test_tokens.py test_gateway.py test_cli.py
+  test_registry.py test_tokens.py test_gateway.py test_cli.py test_system.py
+  conftest.py        sample app, sample site, prefixed System, tree hash
   test_e2e.py        full apply into a temp root + live gateway + live app
   test_hardening.py  systemd-analyze security (Linux+systemd only)
+  test_hygiene.py    no unfinished markers; every README command parses
 specs/  IMPLEMENTATION_PLAN.md  AGENTS.md  README.md  pyproject.toml
 ```
 
@@ -207,7 +210,7 @@ where the tests are densest.
 ```python
 Target  = (kind: Literal["python","static"], root: Path, entry: Path | None)
 Unit    = (name: str, domain: str, kind: str, port: int, gw_port: int,
-           tls: Literal["acme","internal"], created_at: str)
+           tls: Literal["acme","internal"], created_at: str)   # lives in naming.py
 Action  = (verb: Literal["mkdir","write","chown","chmod","user","systemctl",
                          "caddy_reload","rm"], target: str, detail: dict,
            state: Literal["create","change","unchanged"])
@@ -230,7 +233,10 @@ expenses.example.com {
 }
 ```
 
-Static units swap the final line for `root * /opt/smallapp/NAME` + `file_server`.
+Static units swap the final line for `root * /opt/smallapp/NAME` + `file_server`, so
+Caddy serves the bytes directly. They still get an app service (stdlib
+`python3 -m http.server` on `$PORT`), which keeps every unit uniform for `status`,
+restart-on-boot, and the end-to-end test's upstream.
 `--tls internal` adds a `tls internal` line.
 
 ## § Acceptance criteria

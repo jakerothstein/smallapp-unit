@@ -18,6 +18,9 @@ Requires `uv` (https://docs.astral.sh/uv/) and Python >= 3.11. No other setup.
 | Run the CLI | `uv run smallapp --help` |
 | Test | `uv run pytest` |
 | Test (one file) | `uv run pytest tests/test_gateway.py` |
+| Test (fast only) | `uv run pytest -m "not slow"` (skips the subprocess e2e tests) |
+| Refresh golden files | `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py` |
+| Deploy into a prefix | `uv run smallapp apply APP.py --name n --domain n.example.com --root /tmp/h` |
 | Lint | `uv run ruff check .` |
 | Format check | `uv run ruff format --check .` |
 | Format (fix) | `uv run ruff format .` |
@@ -62,4 +65,9 @@ systemd + Caddy. Tests that need real systemd (`tests/test_hardening.py`) skip w
 explicit reason elsewhere; they must never pass vacuously.
 
 Use `--root DIR` to apply into a prefix without root. That is how the end-to-end test
-works, and it is the only supported way to test apply on a laptop.
+works, and it is the only supported way to test apply on a laptop. Under a prefix,
+`useradd`, `systemctl` and `caddy reload` become no-ops and users are recorded as
+marker files in `<root>/var/lib/smallapp/users/`.
+
+`systemd-analyze security` (criterion 26) has only ever skipped on macOS. On a Linux
+box run `uv run pytest tests/test_hardening.py` and confirm it does not skip.
