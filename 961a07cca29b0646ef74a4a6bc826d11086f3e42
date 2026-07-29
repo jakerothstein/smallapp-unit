@@ -1,0 +1,39 @@
+QA round 6 — reasoning for future loops.
+
+Why IPAddressDeny=any and not something smaller: systemd has no ingress-only
+knob. RestrictNetworkInterfaces=lo and PrivateNetwork=yes both also kill
+egress, and PrivateNetwork additionally hides the app from Caddy. Blocking
+peer addresses is the only lever that leaves Caddy->app working. Consequence
+is total: the app cannot call anybody. If a future loop wants outbound calls,
+add per-unit IPAddressAllow= CIDRs; do not go back to 'any'.
+
+Why deps move to apply time rather than a venv: uv sync --script + a
+UV_CACHE_DIR the unit owns is ~15 lines through the System seam. Building a
+venv under /opt would have needed stale_payload exclusions, a new artifact
+row in the Scope table, and its own ownership rules. Verified by hand and by
+tests/test_e2e.py::test_a_pep723_app_starts_offline_from_the_cache_apply_built,
+which resolves a real package and then starts with --offline, so it fails if
+apply ever stops populating the cache.
+
+Why a group and not an ACL for static payloads: setfacl does not exist on
+macOS, so an ACL-based fix could never be exercised by this repo's tests, and
+it needs the acl package plus a mount option on the host. A supplementary
+group needs neither. The wrinkle is that supplementary groups are read at
+process start, so the group action restarts Caddy instead of reloading it.
+That restart only ever happens on the first apply of a static unit.
+
+Why created-dirs instead of a fixed PRUNE_DIRS list: the old list walked
+parents, so an empty /opt or /etc/systemd/system could be removed even though
+smallapp never made it. Recording the topmost directory each mkdir had to
+create is the only version that can honestly claim 'only what we created'.
+The record is per-process plus a persisted file, because rm runs in a
+different process from apply.
+
+Why resolve_secrets now takes 'known': the env file is not evidence that the
+apply finished. Only the registry's complete flag is. Rotating on an
+incomplete unit is safe (nobody has a session yet); reusing is not (nobody
+ever saw the token).
+
+Still unverified on this machine: every chgrp/chown/group-membership path is
+a no-op under --root, so those assertions are about the plan, not the
+resulting uids. Criterion 26 and this belong to the first Linux box.
