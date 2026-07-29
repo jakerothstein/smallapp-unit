@@ -1,0 +1,52 @@
+Reasoning for future loops
+==========================
+
+Why two uids instead of tightening one: the app is attacker-controlled by
+assumption (it is whatever file the operator pointed at). Anything the app can
+read, the attacker reads. The gateway holds SMALLAPP_SECRET and the token hash.
+Same uid meant the session forgery material sat inside the blast radius. The
+26-char name limit is a direct consequence, not a style choice: useradd rejects
+names over 32 and "sa-" + name + "-gw" is name+6.
+
+Why the loopback hole is still open: three fixes were considered.
+PrivateNetwork=yes gives each unit its own netns, which kills outbound network
+and therefore kills `uv run --script` for PEP 723 apps -- that is the product's
+headline feature, so it loses. systemd's IPAddressAllow is address-based; every
+unit is 127.0.0.1, so it cannot separate them. nftables per-uid rules would work
+but firewall management is an explicit spec non-goal and would make the tool
+own state it cannot reliably clean up on rm. SocketBindDeny=any was taken
+because it is free and stops the cheap version (a unit squatting another's
+port). The residual (a unit can *connect* to a neighbour's port) is documented
+in the spec threat model. Do not "fix" this without a design that keeps
+uv run --script working.
+
+Why completeness is a registry field rather than a journal: the failure was
+apply dying between side effects and then reporting "unchanged" forever. A
+write-ahead log would fix it precisely, but every action is already idempotent,
+so a single `complete` bit that forces a full redo is the same outcome for a
+fraction of the code. The reservation (complete=False) is written *before* any
+side effect on purpose -- a crash before that point leaves nothing to clean up.
+
+Why flock on the directory and not a lock file: criterion 14 says rm leaves
+nothing behind, and a lock file is something behind. Locking the directory the
+state already lives in has no artifact. The consequence is that taking the lock
+creates /var/lib/smallapp, so rm of an unknown unit must prune it again.
+
+Why the symlink check is prefix-only: macOS /etc is itself a symlink to
+/private/etc, so an unconditional check makes System("/") refuse every write.
+Unprefixed writes require root anyway, where symlink games are moot. It is
+lstat-then-open, not openat(O_NOFOLLOW) per component -- the TOCTOU window is
+real and marked in the code.
+
+Why AST for PORT: the regex matched the word in comments, docstrings and
+strings, so `# reads PORT` deployed a broken unit. The AST walk recognises the
+five real forms (os.environ[...], environ[...], os.environ.get, os.getenv,
+getenv, plus the bytes variants) and nothing else. A false negative here is a
+loud failure at apply time; a false positive was a silent failure at runtime,
+which is why it errs toward strict.
+
+The repo was flipped to public in this loop. The README's install command was
+un-runnable before that -- worth remembering that "documented" and "works" are
+different tests, which is why tests/test_e2e.py now actually performs the
+documented uv tool install into temp dirs mirroring /opt/uv/tools and
+/usr/local/bin and starts the rendered ExecStart with only the service PATH.
