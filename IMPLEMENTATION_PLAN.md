@@ -9,26 +9,10 @@ that the slice closes. Do not start a slice before the one above it is green.
 `pyproject.toml`, package, stub test, README, `.gitignore`. Bootstrap/test/lint/typecheck
 all pass. — closes (1) partially, (2), (3).
 
-## 1. `smallapp --help` runs end to end
+## 1-3. CLI shell, target detection, tokens (done)
 
-`cli.py` with argparse and all six subcommands wired to functions that print a
-one-line "not yet" and exit 3; `__main__.py`; console script entry point.
-Test: `--help` exit 0, names all six commands; each subcommand is reachable.
-— closes (4).
-
-## 2. Target detection
-
-`target.py` + `naming.py`: classify python vs static, validate names, deterministic
-port allocation (registry-free path first). Wire `plan` to print the detected kind
-and port. Test each accept and each rejection message.
-— closes (5), (6), part of (7), (25).
-
-## 3. Tokens
-
-`tokens.py`: `generate_secret`, `generate_token`, `hash_token`/`verify_token`
-(salted scrypt), `sign_cookie`/`verify_cookie` (hmac-sha256, `v1.` prefix, exp).
-Pure module, no I/O. Test all six negative verify cases.
-— closes (16), (17), and the `compare_digest` half of (20).
+`cli.py` (six commands, `plan` wired), `target.py`, `naming.py`, `tokens.py` and
+their tests. — closes (4), (5), (6), part of (7), (25), (16), (17), half of (20).
 
 ## 4. Gateway
 
