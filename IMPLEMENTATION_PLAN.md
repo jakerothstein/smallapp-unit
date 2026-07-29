@@ -1,5 +1,73 @@
 # Implementation plan
 
+## QA FINDINGS (round 5, 2026-07-29)
+
+### 1. HIGH — An interrupted first apply can permanently lose the login token
+
+- **File:** `src/smallapp/plan.py:41-49`, `src/smallapp/apply.py:44-69`,
+  `src/smallapp/cli.py:132-145`
+- **Reproduce:** Inject a failure after `/etc/smallapp/NAME.env` is written but before
+  `apply_unit()` returns. The first invocation never prints its in-memory token; the
+  retry reads the env file, sets `Secrets.token` to `None`, and also prints no token.
+- **Fixed:** A retry after any partial first apply must provide a usable one-time login
+  token without requiring manual file deletion or secret recovery.
+
+### 2. HIGH — Python apps can bypass Caddy authentication by binding publicly
+
+- **File:** `src/smallapp/templates.py:64-65`
+- **Reproduce:** Deploy an app that binds `0.0.0.0:$PORT`, then request the allocated
+  `18xxx` port through the host's public address without a cookie.
+- **Fixed:** The service independently enforces loopback-only reachability even when
+  untrusted app code binds `0.0.0.0` or `::`.
+
+### 3. HIGH — Every app can read every other unit's payload
+
+- **File:** `src/smallapp/render.py:21,114-120`,
+  `src/smallapp/system.py:115-118`
+- **Reproduce:** Deploy `victim`, then as another unit user read
+  `/opt/smallapp/victim/app.py`; directories are `0755` and payloads are `0644`.
+- **Fixed:** Each app UID can read only its own payload; static content grants Caddy
+  access without granting every app UID access.
+
+### 4. MEDIUM — A failed removal cannot be retried
+
+- **File:** `src/smallapp/apply.py:102-104`
+- **Reproduce:** Make `caddy_reload()` fail during `rm`, then retry. The first attempt
+  already dropped the registry entry, so the retry reports `not found`.
+- **Fixed:** Removal keeps retry state until daemon-reload and Caddy reload succeed.
+
+### 5. MEDIUM — Unknown-unit removal deletes pre-existing empty directories
+
+- **File:** `src/smallapp/apply.py:77-79,106-107`,
+  `src/smallapp/system.py:127-132`
+- **Reproduce:** Pre-create an empty `etc/caddy/smallapp.d` under a prefix and run
+  `smallapp rm ghost --root ROOT`; the directory and empty parents are deleted.
+- **Fixed:** Unknown-unit removal changes nothing, and known-unit removal prunes only
+  directories smallapp can prove it created.
+
+### 6. MEDIUM — PORT validation accepts fake reads and rejects a valid read
+
+- **File:** `src/smallapp/target.py:64-73`
+- **Reproduce:** `reads_port('Fake().getenv("PORT")')` is `True`, while
+  `reads_port('import os\nos.getenv(key="PORT")')` is `False`.
+- **Fixed:** Accept supported positional and keyword reads from actual `os`
+  environment APIs and reject unrelated methods named `getenv`.
+
+### 7. LOW — `plan --out` exposes a traceback for filesystem errors
+
+- **File:** `src/smallapp/cli.py:104-107`
+- **Reproduce:** Run `smallapp plan SITE --name x --domain x.example.com --out
+  README.md`; it exits with an uncaught `FileExistsError` traceback.
+- **Fixed:** Print a concise error naming the output path and exit 1 without traceback.
+
+### 8. LOW — Invalid `apply` targets use the wrong exit code
+
+- **File:** `src/smallapp/cli.py:118-122`
+- **Reproduce:** Run `smallapp apply /nonexistent --name x --domain x.example.com
+  --root ROOT`; it exits 2 although the apply contract requires 1 for every failure.
+- **Fixed:** Invalid apply targets exit 1; exit 2 remains specific to invalid plan
+  targets.
+
 ## QA FINDINGS (round 4, 2026-07-29)
 
 ### 1. HIGH — Python apps can bypass Caddy authentication by binding publicly
