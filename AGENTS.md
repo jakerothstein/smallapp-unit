@@ -21,6 +21,7 @@ Requires `uv` (https://docs.astral.sh/uv/) and Python >= 3.11. No other setup.
 | Test (fast only) | `uv run pytest -m "not slow"` (skips the subprocess e2e tests) |
 | Test (slow only) | `uv run pytest -m slow` (real subprocesses; one needs network) |
 | Refresh golden files | `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py` |
+| Test (needs network) | `uv run pytest -m slow` — two of them resolve real packages |
 | Deploy into a prefix | `uv run smallapp apply APP.py --name n --domain n.example.com --root /tmp/h` |
 | Lint | `uv run ruff check .` |
 | Format check | `uv run ruff format --check .` |
@@ -71,6 +72,17 @@ works, and it is the only supported way to test apply on a laptop. Under a prefi
 marker files in `<root>/var/lib/smallapp/users/`.
 
 ## Facts the loop keeps re-learning
+
+- Units carry `IPAddressDeny=any` + `IPAddressAllow=localhost`: that, not
+  `SocketBindAllow=`, is what makes an app unreachable from off the box. It also means
+  **a deployed app has no outbound network**, which is why PEP 723 deps are resolved at
+  apply time (`uv sync --script`) and the unit runs `uv run --offline`.
+- Payloads are `root:sa-NAME`, dir `0750`, files `0640`. Static units additionally add
+  `caddy` to group `sa-NAME` and **restart** (not reload) Caddy: supplementary groups
+  are read once at process start.
+- `rm` prunes only directories recorded in `/var/lib/smallapp/created-dirs`. If you add
+  a directory to apply, create it through `System.mkdir`/`System.write` or it will be
+  left behind.
 
 - Unit names are **1-26 chars**: `sa-NAME-gw` must fit the 32-char unix username limit.
 - Every unit gets **two** users (`sa-NAME`, `sa-NAME-gw`) and **two** state dirs

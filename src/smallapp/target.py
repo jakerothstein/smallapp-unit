@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,21 @@ Kind = Literal["python", "static"]
 PORT_VAR = "PORT"
 INDEX = "index.html"
 MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+
+# The reference regex from PEP 723, restricted to the `script` block.
+PEP723_RE = re.compile(
+    r"(?m)^# /// script$\s(?P<body>(^#(| .*)$\s)+)^# ///$",
+)
+
+
+def declares_dependencies(source: str) -> bool:
+    """True when the script carries a PEP 723 `# /// script` block.
+
+    That block is the only signal that the app needs third-party packages, and so the
+    only reason to involve `uv`. A bare marker in a docstring is not a block: the
+    regex requires the closing `# ///` too.
+    """
+    return PEP723_RE.search(source) is not None
 
 
 class TargetError(ValueError):
@@ -34,10 +50,21 @@ class Target:
         return sorted(p for p in self.root.rglob("*") if p.is_file())
 
 
-def _is_environ(node: ast.expr) -> bool:
-    """`os.environ`, `environ`, or `os.environb`-style access to the process env."""
+def _is_os(node: ast.expr) -> bool:
+    """The `os` module itself: `os`, or an attribute chain ending in `.os`."""
     if isinstance(node, ast.Attribute):
-        return node.attr in ("environ", "environb")
+        return node.attr == "os"
+    return isinstance(node, ast.Name) and node.id == "os"
+
+
+def _is_environ(node: ast.expr) -> bool:
+    """`os.environ`/`os.environb`, or a bare `environ` imported from `os`.
+
+    An attribute must hang off `os`: `Fake().environ` is somebody else's mapping and
+    reading `PORT` from it says nothing about how the app is served.
+    """
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("environ", "environb") and _is_os(node.value)
     return isinstance(node, ast.Name) and node.id in ("environ", "environb")
 
 
@@ -62,15 +89,28 @@ def reads_port(source: str) -> bool:
 
 
 def _is_port_call(node: ast.Call) -> bool:
-    if not node.args or not _is_port_literal(node.args[0]):
+    """`os.getenv("PORT")` / `os.environ.get("PORT")` and their keyword spellings.
+
+    The receiver must really be `os` (or a name imported from it): a method merely
+    *named* `getenv` on some other object does not read the process environment.
+    """
+    if not _reads_port_argument(node):
         return False
     function = node.func
     if isinstance(function, ast.Attribute):
-        # os.getenv("PORT") / os.environ.get("PORT")
-        return function.attr in ("getenv", "getenvb") or (
-            function.attr == "get" and _is_environ(function.value)
-        )
+        if function.attr in ("getenv", "getenvb"):
+            return _is_os(function.value)
+        return function.attr == "get" and _is_environ(function.value)
     return isinstance(function, ast.Name) and function.id in ("getenv", "getenvb")
+
+
+def _reads_port_argument(node: ast.Call) -> bool:
+    """`PORT` passed positionally, or as `key=` — the only keyword these APIs name it."""
+    if node.args:
+        return _is_port_literal(node.args[0])
+    return any(
+        keyword.arg == "key" and _is_port_literal(keyword.value) for keyword in node.keywords
+    )
 
 
 def detect(path: str | Path) -> Target:

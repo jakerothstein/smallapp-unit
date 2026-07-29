@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from smallapp.naming import Unit, ValidationError
-from smallapp.render import render
+from smallapp.render import render, uv_cache_dir
 from smallapp.target import Target, detect
 
 GOLDEN = Path(__file__).parent / "golden"
@@ -29,6 +29,9 @@ REQUIRED_DIRECTIVES = [
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
     "SystemCallFilter=@system-service",
     "MemoryMax=",
+    # QA round 6 #2: without these an app that binds 0.0.0.0 answers around Caddy.
+    "IPAddressDeny=any",
+    "IPAddressAllow=localhost",
 ]
 
 
@@ -86,7 +89,13 @@ def test_python_render_produces_exactly_the_scoped_artifacts(python_target: Targ
     }
     assert files["/opt/smallapp/expenses/app.py"].content == APP_SOURCE.encode()
     assert files["/etc/smallapp/expenses.env"].mode == 0o600
-    assert all(f.mode == 0o644 for p, f in files.items() if not p.endswith(".env"))
+    # The payload is 0640 root:sa-NAME: no other unit's uid may read another's source.
+    assert files["/opt/smallapp/expenses/app.py"].mode == 0o640
+    assert all(
+        f.mode == 0o644
+        for p, f in files.items()
+        if not p.endswith(".env") and not p.startswith("/opt/smallapp/")
+    )
 
 
 def test_static_render_mirrors_every_payload_file(static_target: Target) -> None:
@@ -158,7 +167,7 @@ def test_pep723_script_runs_under_uv(tmp_path: Path) -> None:
     text = render(detect(app), python_unit(), SECRET, TOKEN_HASH)[
         "/etc/systemd/system/smallapp-expenses.service"
     ].text
-    assert "ExecStart=/usr/bin/env uv run --script /opt/smallapp/expenses/app.py" in text
+    assert "ExecStart=/usr/bin/env uv run --offline --script /opt/smallapp/expenses/app.py" in text
 
 
 def test_static_unit_serves_the_directory_on_port(static_target: Target) -> None:
@@ -277,3 +286,40 @@ def test_generated_units_document_the_real_repository(python_target: Target) -> 
     for unit_text in _units(python_target):
         assert "Documentation=https://github.com/jakerothstein/smallapp-unit" in unit_text
         assert "github.com/smallapp/unit" not in unit_text
+
+
+def test_a_wildcard_binding_app_is_still_unreachable_from_the_internet(
+    python_target: Target, static_target: Target
+) -> None:
+    """QA round 6 #2: `SocketBindAllow=` restricts the port, not the local address.
+
+    Only the cgroup address filter makes reachability independent of what the untrusted
+    app chose to bind, so both units must carry it, in that order.
+    """
+    for target, unit in ((python_target, python_unit()), (static_target, static_unit())):
+        files = render(target, unit, SECRET, TOKEN_HASH)
+        for path, text in ((p, f.text) for p, f in files.items() if p.endswith(".service")):
+            assert "IPAddressDeny=any\nIPAddressAllow=localhost" in text, path
+
+
+def test_a_pep723_script_runs_offline_from_a_cache_inside_its_state_dir(tmp_path: Path) -> None:
+    """QA round 6 #2: the unit has no egress, so `uv` may not resolve at start-up."""
+    app = tmp_path / "expenses.py"
+    app.write_text(
+        '# /// script\n# dependencies = ["httpx"]\n# ///\nimport os\nos.environ["PORT"]\n'
+    )
+    text = render(detect(app), python_unit(), SECRET, TOKEN_HASH)[
+        "/etc/systemd/system/smallapp-expenses.service"
+    ].text
+    assert "ExecStart=/usr/bin/env uv run --offline --script" in text
+    assert "Environment=UV_CACHE_DIR=/var/lib/smallapp/expenses/uv-cache" in text
+    assert uv_cache_dir(python_unit()) == "/var/lib/smallapp/expenses/uv-cache"
+
+
+def test_a_docstring_mentioning_the_marker_is_not_a_dependency_block(tmp_path: Path) -> None:
+    app = tmp_path / "expenses.py"
+    app.write_text('"""not really: # /// script"""\nimport os\nos.environ["PORT"]\n')
+    text = render(detect(app), python_unit(), SECRET, TOKEN_HASH)[
+        "/etc/systemd/system/smallapp-expenses.service"
+    ].text
+    assert "ExecStart=/usr/bin/env python3 /opt/smallapp/expenses/app.py" in text

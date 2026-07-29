@@ -9,6 +9,12 @@ from __future__ import annotations
 
 # Directives shared by both units. Together these keep `systemd-analyze security`
 # under 4.0; removing any one of them raises the exposure score.
+#
+# `IPAddressDeny=any` with `IPAddressAllow=localhost` is the one that does not just
+# raise a score: it is what makes the app unreachable from the internet even when the
+# app binds `0.0.0.0`. `SocketBindAllow=` restricts the port, not the address, so
+# without this an app that ignores `--bind 127.0.0.1` would answer around Caddy and
+# around the owner cookie. Both units therefore only ever speak to loopback.
 HARDENING = """\
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -29,6 +35,8 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
@@ -55,6 +63,7 @@ Group={user}
 WorkingDirectory={app_dir}
 Environment=PORT={port}
 Environment=HOME=/var/lib/smallapp/{name}
+Environment=UV_CACHE_DIR=/var/lib/smallapp/{name}/uv-cache
 ExecStart={exec_start}
 Restart=always
 RestartSec=1

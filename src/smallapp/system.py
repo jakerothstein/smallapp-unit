@@ -8,6 +8,7 @@ laptop. Everything above this module is pure and needs no root to exercise.
 from __future__ import annotations
 
 import fcntl
+import grp
 import os
 import pwd
 import re
@@ -20,11 +21,16 @@ from pathlib import Path, PurePosixPath
 
 USERADD = "/usr/sbin/useradd"
 USERDEL = "/usr/sbin/userdel"
+USERMOD = "/usr/sbin/usermod"
 USERDEL_NO_SUCH_USER = 6  # userdel(8): "specified user doesn't exist"
 SYSTEMCTL = "systemctl"
 CADDY = "caddy"
+UV = "uv"
+CADDY_USER = "caddy"
 USER_MARKER_DIR = "var/lib/smallapp/users"
+GROUP_MARKER_DIR = "var/lib/smallapp/groups"
 LOCK_DIR = "/var/lib/smallapp"
+CREATED_DIRS = "/var/lib/smallapp/created-dirs"
 
 
 class StepError(RuntimeError):
@@ -41,6 +47,9 @@ class System:
     def __init__(self, root: str | Path = "/") -> None:
         self.root = Path(root).resolve()
         self.prefixed = self.root != Path("/")
+        # Logical paths of directories this process had to create. `rm` may prune an
+        # empty directory only if smallapp can show it created it.
+        self.created: list[str] = []
 
     def path(self, absolute: str) -> Path:
         """Map an absolute artifact path into this system's root.
@@ -110,11 +119,35 @@ class System:
         os.replace(temporary, target)
 
     def mkdir_p(self, target: Path) -> None:
+        """Create `target` and any missing parents, recording the topmost one created.
+
+        The record is what makes `rm` safe: an empty `/opt` that was already there when
+        smallapp arrived is left alone, and one smallapp had to create is taken away
+        again.
+        """
+        if target.is_dir():
+            return
+        highest = target
+        while (
+            highest.parent != highest
+            and highest.parent != self.root
+            and not highest.parent.is_dir()
+        ):
+            highest = highest.parent
+        self._record_created(highest)
         target.mkdir(parents=True, exist_ok=True)
+
+    def _record_created(self, target: Path) -> None:
+        try:
+            logical = "/" + target.relative_to(self.root).as_posix()
+        except ValueError:  # pragma: no cover - path() already confines to the root
+            return
+        if logical not in self.created:
+            self.created.append(logical)
 
     def mkdir(self, absolute: str, mode: int = 0o755) -> None:
         target = self.path(absolute)
-        target.mkdir(parents=True, exist_ok=True)
+        self.mkdir_p(target)
         os.chmod(target, mode)
 
     def remove(self, absolute: str) -> None:
@@ -124,12 +157,48 @@ class System:
         elif target.exists() or target.is_symlink():
             target.unlink()
 
-    def prune_empty(self, absolute: str) -> None:
-        """Remove `absolute` and its parents while they are empty, staying inside root."""
-        target = self.path(absolute)
-        while target != self.root and target.is_dir() and not any(target.iterdir()):
-            target.rmdir()
-            target = target.parent
+    def flush_created(self) -> None:
+        """Persist the created-directory record so a later `rm` process can read it."""
+        if not self.created:
+            return
+        known = self._read_created()
+        merged = sorted(set(known) | set(self.created))
+        if merged != sorted(known):
+            self.write(CREATED_DIRS, ("\n".join(merged) + "\n").encode(), 0o644)
+
+    def _read_created(self) -> list[str]:
+        raw = self.read(CREATED_DIRS)
+        if raw is None:
+            return []
+        text = raw.decode("utf-8", "replace")
+        return [line for line in text.splitlines() if line.startswith("/")]
+
+    def prune_created(self) -> None:
+        """Remove every recorded directory that is now empty, deepest first.
+
+        Directories smallapp never created are never touched, so `rm` cannot delete a
+        pre-existing `/etc/caddy/smallapp.d` or walk up into somebody else's `/opt`.
+        """
+        recorded = sorted(
+            set(self._read_created()) | set(self.created),
+            key=lambda item: item.count("/"),
+            reverse=True,
+        )
+        self.created = []
+        self.remove(CREATED_DIRS)
+        left = [logical for logical in recorded if not self._rmdir_empty(self.path(logical))]
+        if left and self.path(LOCK_DIR).is_dir():
+            self.write(CREATED_DIRS, ("\n".join(sorted(left)) + "\n").encode(), 0o644)
+
+    def _rmdir_empty(self, target: Path) -> bool:
+        """Remove `target` if it is an empty directory tree. True when it is gone."""
+        if target == self.root or not target.is_dir() or target.is_symlink():
+            return False
+        for child in target.iterdir():
+            if not (child.is_dir() and not child.is_symlink() and self._rmdir_empty(child)):
+                return False
+        target.rmdir()
+        return True
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -143,7 +212,7 @@ class System:
         never-pruned file if simultaneous rm and apply ever becomes real.
         """
         target = self.path(LOCK_DIR)
-        target.mkdir(parents=True, exist_ok=True)
+        self.mkdir_p(target)
         descriptor = os.open(target, os.O_RDONLY)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -178,18 +247,93 @@ class System:
             marker = self.root / USER_MARKER_DIR / user
             if marker.exists():
                 marker.unlink()
+            group_marker = self.root / GROUP_MARKER_DIR / user
+            if group_marker.exists():
+                group_marker.unlink()
             return
         self._run(f"delete user {user}", [USERDEL, user], tolerate=(USERDEL_NO_SUCH_USER,))
 
     def chown(self, absolute: str, user: str) -> None:
-        """Give `absolute` to `user`. A no-op under a prefix, where there is no such uid."""
+        """Give `absolute` and everything under it to `user`.
+
+        Recursive because a state directory may already hold files this process created
+        as root — a pre-built `uv` cache, most of all — and the unit must own them.
+        A no-op under a prefix, where there is no such uid.
+        """
         if self.prefixed:
             return
         try:
             entry = pwd.getpwnam(user)
         except KeyError as exc:
             raise StepError(f"chown {absolute}", f"no such user {user}") from exc
-        os.chown(self.path(absolute), entry.pw_uid, entry.pw_gid)
+        self._chown_tree(self.path(absolute), entry.pw_uid, entry.pw_gid)
+
+    def _chown_tree(self, target: Path, uid: int, gid: int) -> None:
+        os.chown(target, uid, gid)
+        if not target.is_dir():
+            return
+        for parent, directories, names in os.walk(target):
+            for item in (*directories, *names):
+                path = Path(parent) / item
+                if not path.is_symlink():
+                    os.chown(path, uid, gid)
+
+    def chgrp(self, absolute: str, group: str) -> None:
+        """Give `absolute` and everything under it to `group`, keeping root as owner.
+
+        This is what stops one unit's uid reading another's payload: the payload stays
+        root-owned and unwritable, but only the unit's own group may read it.
+        A no-op under a prefix, where there is no such gid.
+        """
+        if self.prefixed:
+            return
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError as exc:
+            raise StepError(f"chgrp {absolute}", f"no such group {group}") from exc
+        self._chown_tree(self.path(absolute), 0, gid)
+
+    def group_members(self, group: str) -> set[str]:
+        if self.prefixed:
+            marker = self.root / GROUP_MARKER_DIR / group
+            if not marker.is_file():
+                return set()
+            return set(marker.read_text().split())
+        try:
+            return set(grp.getgrnam(group).gr_mem)
+        except KeyError:
+            return set()
+
+    def add_group_member(self, group: str, user: str) -> None:
+        """Add `user` to `group` as a supplementary member.
+
+        Used to let Caddy — and nothing else — read a static unit's payload. The group
+        is the unit's own, created by `useradd --system`, so it disappears with the
+        unit and takes the membership with it.
+        """
+        if self.prefixed:
+            marker = self.root / GROUP_MARKER_DIR / group
+            self.mkdir_p(marker.parent)
+            members = self.group_members(group) | {user}
+            marker.write_text("\n".join(sorted(members)) + "\n")
+            return
+        self._run(f"add {user} to group {group}", [USERMOD, "--append", "--groups", group, user])
+
+    def uv_sync_script(self, script: str, cache_dir: str) -> None:
+        """Pre-build a PEP 723 script's environment, so the running unit needs no network.
+
+        The app service denies every non-loopback address, which is what stops untrusted
+        app code from being reachable around Caddy. That also means `uv` cannot resolve
+        anything at start-up, so resolution happens here, at apply time, into a cache the
+        unit can read.
+        """
+        cache = self.path(cache_dir)
+        self.mkdir_p(cache)
+        self._run(
+            f"install dependencies for {script}",
+            [UV, "sync", "--script", str(self.path(script))],
+            env={"UV_CACHE_DIR": str(cache)},
+        )
 
     def systemctl(self, *args: str) -> None:
         if self.prefixed:
@@ -215,10 +359,20 @@ class System:
     def is_root(self) -> bool:
         return os.geteuid() == 0
 
-    def _run(self, step: str, command: list[str], tolerate: tuple[int, ...] = ()) -> None:
+    def _run(
+        self,
+        step: str,
+        command: list[str],
+        tolerate: tuple[int, ...] = (),
+        env: dict[str, str] | None = None,
+    ) -> None:
         try:
             result = subprocess.run(  # noqa: S603
-                command, capture_output=True, text=True, check=False
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=None if env is None else {**os.environ, **env},
             )
         except OSError as exc:
             raise StepError(step, str(exc)) from exc

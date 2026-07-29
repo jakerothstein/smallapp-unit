@@ -28,7 +28,9 @@ Debian/Ubuntu host converts a *deploy target* into a *unit*.
 
 A **deploy target** is exactly one of:
 - a single Python file that serves HTTP on `127.0.0.1:$PORT` (deps declared inline
-  via PEP 723 `# /// script` metadata, installed by `uv`), or
+  via PEP 723 `# /// script` metadata, resolved by `uv` at **apply** time into
+  `/var/lib/smallapp/NAME/uv-cache`, because the running unit has no outbound
+  network), or
 - a directory containing `index.html` (served as static files).
 
 A **unit** named `NAME` is this set of artifacts, and nothing else:
@@ -37,7 +39,7 @@ A **unit** named `NAME` is this set of artifacts, and nothing else:
 | --- | --- |
 | dedicated app unix user | `sa-NAME` (system, `/usr/sbin/nologin`, no home) |
 | dedicated gateway unix user | `sa-NAME-gw` (system, `/usr/sbin/nologin`, no home) |
-| app payload | `/opt/smallapp/NAME/` (root-owned, world-readable, app cannot write it) |
+| app payload | `/opt/smallapp/NAME/` (root-owned, group `sa-NAME`, dir `0750`, files `0640`: the app cannot write it and no other unit's uid can read it) |
 | writable state | `/var/lib/smallapp/NAME/` and `/var/lib/smallapp/NAME-gw/` (via `StateDirectory=`) |
 | secrets | `/etc/smallapp/NAME.env` (mode 0600, root-owned) |
 | app service | `/etc/systemd/system/smallapp-NAME.service` (hardened) |
@@ -50,8 +52,8 @@ Properties v1 guarantees:
 2. **Hardened.** Generated units carry `NoNewPrivileges`, `ProtectSystem=strict`,
    `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables`,
    `ProtectControlGroups`, `RestrictSUIDSGID`, `RestrictAddressFamilies`,
-   `SystemCallFilter=@system-service`, `MemoryMax`, and score < 4.0 under
-   `systemd-analyze security`.
+   `SystemCallFilter=@system-service`, `MemoryMax`, `IPAddressDeny=any` with
+   `IPAddressAllow=localhost`, and score < 4.0 under `systemd-analyze security`.
 3. **Private by default.** Every unit sits behind a self-contained signed-cookie
    gateway. No OAuth provider, no Redis, no Cloudflare account, no Caddy plugin —
    stock Caddy `forward_auth` pointing at a ~150-line stdlib HTTP service. The gateway
@@ -68,17 +70,30 @@ Trusted: root, systemd, Caddy, and the operator. Untrusted: the deployed app, wh
 assumed to be unaudited agent-written code, and the internet.
 
 What is enforced: an app cannot read another unit's files, the gateway's environment,
-or the rest of the box (`ProtectSystem=strict`, per-unit uids, `ProtectProc=invisible`,
-no capabilities, a syscall filter); it cannot bind a port other than its own
-(`SocketBindDeny=any`); it cannot reach Caddy's admin API, which `doctor` requires to
-be `off` or on a unix socket rather than `127.0.0.1:2019`; and nothing reaches the app
-from the internet without an owner cookie.
+or the rest of the box (`ProtectSystem=strict`, per-unit uids and per-unit groups,
+`ProtectProc=invisible`, no capabilities, a syscall filter); it cannot bind a port other
+than its own (`SocketBindDeny=any`); it cannot be reached from off the box whatever
+address it binds, because `IPAddressDeny=any` with `IPAddressAllow=localhost` filters
+the unit's cgroup and `SocketBindAllow=` alone would only restrict the port; it cannot
+reach Caddy's admin API, which `doctor` requires to be `off` or on a unix socket rather
+than `127.0.0.1:2019`; and nothing reaches the app from the internet without an owner
+cookie.
+
+Payload confinement is by group: `/opt/smallapp/NAME` is `root:sa-NAME` `0750` and its
+files are `0640`, so `sa-other` gets nothing. A static unit's bytes are served by Caddy,
+so `caddy` — and only `caddy` — is added to `sa-NAME` as a supplementary member; the
+group is created and destroyed with the unit, so the membership goes with it.
+
+The same address filter means a deployed app has **no outbound network**: it can talk to
+loopback and nothing else. That is why PEP 723 dependencies are resolved at apply time
+rather than at start-up. An app that needs to call a third-party API is out of scope for
+v1.
 
 What is **not** enforced: apps share the host loopback interface, so one deployed app
-can connect to another unit's `127.0.0.1:18xxx`. Per-cgroup packet filtering would be
-needed to close that, and firewall management is a non-goal; the gateway, not the
-network, is the auth boundary. This is stated so it is a documented limit rather than
-an assumed guarantee.
+can connect to another unit's `127.0.0.1:18xxx`. Per-cgroup packet filtering by *peer
+port* would be needed to close that, and firewall management is a non-goal; the gateway,
+not the network, is the auth boundary. This is stated so it is a documented limit rather
+than an assumed guarantee.
 
 ### Non-goals (v1)
 
@@ -132,9 +147,13 @@ error: ./expenses.py never reads the PORT environment variable.
 
 Executes the plan. Requires root when `--root /`. `--root DIR` applies into a prefix
 (this is how the end-to-end test runs unprivileged). Prints the same action list with
-`+` (created), `~` (changed), `=` (unchanged). Exit 0 on success, 1 on failure —
-failure names the step that failed on stderr and leaves already-written artifacts in
-place for inspection.
+`+` (created), `~` (changed), `=` (unchanged). Exit 0 on success, 1 on *every* failure,
+including an invalid target — failure names the step that failed on stderr and leaves
+already-written artifacts in place for inspection.
+
+An apply that is interrupted before it finishes is not a finished apply: the retry
+generates fresh secrets and prints a token that works, rather than reusing a hash whose
+plaintext nobody ever saw.
 
 Second identical run:
 
@@ -157,8 +176,11 @@ is-active` for both services.
 ### `smallapp rm NAME [--root /]`
 
 Stops and disables both services, removes every artifact listed in Scope, reloads
-Caddy, drops the registry entry. Idempotent: removing an unknown unit exits 0 with
-`not found, nothing to do`.
+Caddy, then drops the registry entry — last, so a removal that fails part-way can be
+retried by running the same command again. Directories are pruned only where smallapp
+recorded creating them (`/var/lib/smallapp/created-dirs`), so a pre-existing
+`/etc/caddy/smallapp.d` survives. Idempotent: removing an unknown unit changes nothing
+and exits 0 with `not found, nothing to do`.
 
 ### `smallapp gateway`
 
@@ -347,6 +369,20 @@ Every item is checkable by `pytest` or by a command's exit code.
     test asserts this over the shipped package.
 28. `README.md` contains a copy-pasteable quickstart; a test asserts every fenced
     `smallapp ...` command in the README parses under the real argparse parser.
+29. An `apply` interrupted after the env file is written, then retried, prints a login
+    token that verifies against the token hash the retry wrote; a third apply prints
+    none and keeps both secrets.
+30. The rendered payload is mode `0640` inside a `0750` directory and the plan chowns
+    the directory to group `sa-NAME`; a static unit additionally adds exactly `caddy`
+    to that group, and a python unit adds nobody.
+31. `smallapp apply` on an invalid target exits **1** (not 2), and `smallapp plan --out`
+    pointed at a regular file exits 1 naming that path with no traceback.
+32. `rm` of an unknown unit leaves the tree hash unchanged, `rm` of a known unit leaves
+    a pre-existing `/etc/caddy/smallapp.d` in place, and an `rm` whose Caddy reload
+    fails can be retried by re-running the same command.
+33. `target.reads_port` accepts `os.getenv(key="PORT")` and rejects
+    `Fake().getenv("PORT")`; `target.declares_dependencies` needs a whole PEP 723
+    block, not a mention of the marker.
 
 ## Quality bar
 

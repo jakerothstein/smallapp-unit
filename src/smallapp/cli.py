@@ -89,8 +89,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     try:
         target = detect(args.target)
         unit = _unit(system, args, target)
-        secrets = resolve_secrets(system, unit)
-        actions = build(system, target, unit, secrets, registry.load(system).get(unit.name))
+        known = registry.load(system).get(unit.name)
+        secrets = resolve_secrets(system, unit, known)
+        actions = build(system, target, unit, secrets, known)
     except (ValidationError, TargetError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_TARGET
@@ -103,7 +104,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print()
     if args.out:
         files = render(target, unit, secrets.secret, secrets.token_hash)
-        written = write_out(files, Path(args.out))
+        try:
+            written = write_out(files, Path(args.out))
+        except (OSError, StepError) as exc:
+            print(f"error: cannot write artifacts to {args.out}: {exc}", file=sys.stderr)
+            return EXIT_FAIL
         print(f"{summarise(actions)}  (nothing applied; {written} files written to {args.out})")
     else:
         print(f"{summarise(actions)}  (nothing applied; run `smallapp apply`)")
@@ -118,8 +123,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
     try:
         target = detect(args.target)
     except TargetError as exc:
+        # Every apply failure exits 1; exit 2 is specific to `plan`.
         print(f"error: {exc}", file=sys.stderr)
-        return EXIT_BAD_TARGET
+        return EXIT_FAIL
     try:
         # One lock covers allocation through registration: two concurrent applies must
         # not pick the same port or overwrite each other's registry entry.
@@ -128,8 +134,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 unit = _unit(system, args, target)
             except ValidationError as exc:
                 print(f"error: {exc}", file=sys.stderr)
-                return EXIT_BAD_TARGET
-            secrets = resolve_secrets(system, unit)
+                return EXIT_FAIL
+            secrets = resolve_secrets(system, unit, registry.load(system).get(unit.name))
             actions, token = apply_unit(system, target, unit, secrets)
     except (StepError, RegistryError, ValidationError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

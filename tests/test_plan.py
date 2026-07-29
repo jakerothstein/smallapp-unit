@@ -56,7 +56,7 @@ def test_secrets_are_reused_once_written(host: System, python_target: Target) ->
     fresh = resolve_secrets(host, unit)
     assert fresh.token is not None
     apply_unit(host, python_target, unit, fresh)
-    again = resolve_secrets(host, unit)
+    again = resolve_secrets(host, unit, registry.load(host).get(unit.name))
     assert again.token is None
     assert again.secret == fresh.secret
     assert again.token_hash == fresh.token_hash

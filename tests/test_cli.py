@@ -143,3 +143,66 @@ def test_plan_previews_against_the_prefix_it_is_given(
     assert after.returncode == 0, after.stderr
     assert "no changes" in after.stdout, after.stdout
     assert "+ " not in after.stdout, "a second plan wants to redo work that is already done"
+
+
+def test_plan_out_reports_a_filesystem_error_without_a_traceback(
+    tmp_path: pathlib.Path, app_file_for_cli: pathlib.Path
+) -> None:
+    """QA round 6 #7: --out onto a regular file is a user error, not a crash."""
+    blocked = tmp_path / "already-a-file"
+    blocked.write_text("not a directory\n")
+    result = run_cli(
+        "plan",
+        str(app_file_for_cli),
+        "--name",
+        "x",
+        "--domain",
+        "x.example.com",
+        "--out",
+        str(blocked),
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert str(blocked) in result.stderr
+
+
+def test_apply_on_an_invalid_target_exits_1(tmp_path: pathlib.Path) -> None:
+    """QA round 6 #8: every apply failure is exit 1; exit 2 belongs to plan."""
+    root = tmp_path / "root"
+    root.mkdir()
+    result = run_cli(
+        "apply",
+        str(tmp_path / "nonexistent.py"),
+        "--name",
+        "x",
+        "--domain",
+        "x.example.com",
+        "--root",
+        str(root),
+    )
+    assert result.returncode == 1
+    assert "nonexistent.py" in result.stderr
+
+
+def test_apply_on_a_hostile_name_exits_1(tmp_path: pathlib.Path, app_file: pathlib.Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    result = run_cli(
+        "apply",
+        str(app_file),
+        "--name",
+        "Bad Name",
+        "--domain",
+        "x.example.com",
+        "--root",
+        str(root),
+    )
+    assert result.returncode == 1
+    assert "Bad Name" in result.stderr
+
+
+@pytest.fixture
+def app_file_for_cli(tmp_path: pathlib.Path) -> pathlib.Path:
+    app = tmp_path / "app.py"
+    app.write_text('import os\nos.environ["PORT"]\n')
+    return app

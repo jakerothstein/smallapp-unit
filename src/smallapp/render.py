@@ -11,15 +11,18 @@ from dataclasses import dataclass
 
 from . import templates
 from .naming import Unit, validate_domain, validate_name
-from .target import Target
+from .target import Target, declares_dependencies
 
 APP_MEMORY_MAX = "512M"
 GW_MEMORY_MAX = "128M"
 PYTHON_ENTRY = "app.py"
-PEP723_MARKER = "# /// script"
+UV_CACHE_SUFFIX = "uv-cache"
 
 MODE_FILE = 0o644
+MODE_PAYLOAD = 0o640  # root:sa-NAME — no other unit's uid may read it
 MODE_SECRET = 0o600
+MODE_APP_DIR = 0o750
+MODE_STATE_DIR = 0o700
 
 
 @dataclass(frozen=True)
@@ -32,12 +35,20 @@ class RenderedFile:
         return self.content.decode()
 
 
+def uv_cache_dir(unit: Unit) -> str:
+    """Where a PEP 723 unit's pre-built environment lives: inside its own state dir."""
+    return str(unit.state_dir / UV_CACHE_SUFFIX)
+
+
 def exec_start(target: Target, unit: Unit) -> str:
     """The ExecStart line for the app service.
 
     ponytail: a PEP 723 header is the only signal that the app needs third-party
     packages, so only then is `uv` involved. Dependency-free scripts run under plain
     python3, which is why the end-to-end test needs no network.
+
+    `uv run` is `--offline` because the unit may only talk to loopback: apply already
+    populated the cache, and a missing package must fail loudly rather than hang.
     """
     app_dir = unit.app_dir
     if target.kind == "static":
@@ -47,8 +58,8 @@ def exec_start(target: Target, unit: Unit) -> str:
         )
     entry = app_dir / PYTHON_ENTRY
     source = target.files[0].read_text(encoding="utf-8")
-    if PEP723_MARKER in source:
-        return f"/usr/bin/env uv run --script {entry}"
+    if declares_dependencies(source):
+        return f"/usr/bin/env uv run --offline --script {entry}"
     return f"/usr/bin/env python3 {entry}"
 
 
@@ -111,13 +122,13 @@ def _payload(target: Target, unit: Unit) -> dict[str, RenderedFile]:
     if target.kind == "python":
         entry = target.files[0]
         return {
-            str(unit.app_dir / PYTHON_ENTRY): RenderedFile(entry.read_bytes(), MODE_FILE),
+            str(unit.app_dir / PYTHON_ENTRY): RenderedFile(entry.read_bytes(), MODE_PAYLOAD),
         }
     payload: dict[str, RenderedFile] = {}
     for file in target.files:
         relative = file.relative_to(target.root)
         payload[str(unit.app_dir / relative.as_posix())] = RenderedFile(
-            file.read_bytes(), MODE_FILE
+            file.read_bytes(), MODE_PAYLOAD
         )
     return payload
 

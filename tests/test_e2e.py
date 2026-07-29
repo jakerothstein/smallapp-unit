@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -281,4 +282,65 @@ def test_documented_install_puts_smallapp_on_the_service_path(
     }
     app_cmd = exec_start(root / "etc/systemd/system/smallapp-installed.service", root)
     with running(app_cmd, app_env, app_port), running(gw_cmd, env, gw_port):
+        walk_login_path(gw_port, token, b"hello")
+
+
+PEP723_APP = '''\
+# /// script
+# dependencies = ["idna"]
+# ///
+"""A smallapp sample with a real third-party dependency."""
+
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import idna
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        body = idna.encode("hello.example").split(b".")[0]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    port = int(os.environ["PORT"])
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+
+@pytest.mark.slow
+def test_a_pep723_app_starts_offline_from_the_cache_apply_built(tmp_path: Path) -> None:
+    """QA round 6 #2: the unit may only reach loopback, so `uv` must resolve at apply.
+
+    Needs network once, to resolve `idna`; the app itself then starts with `--offline`,
+    which fails loudly if apply did not really populate the cache.
+    """
+    source = tmp_path / "deps.py"
+    source.write_text(PEP723_APP)
+    root = tmp_path / "root"
+    root.mkdir()
+    token = apply_unit_cli(source, "deps", root)
+
+    unit_file = root / "etc/systemd/system/smallapp-deps.service"
+    text = unit_file.read_text()
+    assert "ExecStart=/usr/bin/env uv run --offline --script" in text
+    assert (root / "var/lib/smallapp/deps/uv-cache").is_dir(), "apply built no cache"
+
+    app_port, gw_port = free_port(), free_port()
+    env = gateway_env(root, "deps", app_port, gw_port)
+    env["UV_CACHE_DIR"] = str(root / "var/lib/smallapp/deps/uv-cache")
+    uv = shutil.which("uv")
+    assert uv is not None, "this test needs uv on PATH, exactly as a host running it does"
+    env["PATH"] = os.pathsep.join([str(Path(uv).parent), env["PATH"]])
+    app_cmd = exec_start(unit_file, root)
+    gw_cmd = exec_start(root / "etc/systemd/system/smallapp-deps-gw.service", root)
+
+    with running(app_cmd, env, app_port), running(gw_cmd, env, gw_port):
         walk_login_path(gw_port, token, b"hello")

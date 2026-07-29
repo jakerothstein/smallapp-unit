@@ -5,20 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from . import registry
-from .naming import CADDY_DIR, ENV_DIR, OPT_DIR, STATE_DIR, UNIT_DIR, Unit
+from .naming import Unit
 from .plan import Action, Secrets, build
 from .render import render
 from .system import StepError, System
 from .target import Target
-
-PRUNE_DIRS = (
-    str(OPT_DIR),
-    str(STATE_DIR / "users"),
-    str(STATE_DIR),
-    str(ENV_DIR),
-    str(CADDY_DIR),
-    str(UNIT_DIR),
-)
 
 
 def apply_unit(
@@ -47,14 +38,23 @@ def apply_unit(
         if action.verb == "user":
             system.create_user(action.target)
         elif action.verb == "mkdir":
-            system.mkdir(action.target)
+            system.mkdir(action.target, int(action.detail["mode"], 8))
         elif action.verb == "write":
             rendered = files[action.target]
             system.write(action.target, rendered.content, rendered.mode)
         elif action.verb == "rm":
             system.remove(action.target)
+        elif action.verb == "deps":
+            system.uv_sync_script(action.target, action.detail["cache"])
         elif action.verb == "chown":
             system.chown(action.target, action.detail["user"])
+        elif action.verb == "chgrp":
+            system.chgrp(action.target, action.detail["group"])
+        elif action.verb == "group":
+            system.add_group_member(action.target, action.detail["user"])
+            # Supplementary groups are read once, at process start: Caddy has to be
+            # restarted, not reloaded, before it can read this unit's payload.
+            system.systemctl("restart", "caddy")
         elif action.verb == "systemctl":
             if action.target == "daemon-reload":
                 system.systemctl("daemon-reload")
@@ -66,6 +66,7 @@ def apply_unit(
         else:  # pragma: no cover - Verb is closed; a new one must be handled above
             raise StepError(action.verb, f"unknown verb for {action.target}")
     registry.put(system, replace(unit, created_user=created_user, complete=True))
+    system.flush_created()
     return actions, secrets.token
 
 
@@ -74,9 +75,9 @@ def remove_unit(system: System, name: str) -> list[Action] | None:
     units = registry.load(system)
     unit = units.get(name)
     if unit is None:
-        # Taking the lock created the state directory; leave the host as we found it.
-        for directory in PRUNE_DIRS:
-            system.prune_empty(directory)
+        # Taking the lock may have created the state directory; give back only what
+        # smallapp itself made, and leave every pre-existing directory alone.
+        system.prune_created()
         return None
     actions: list[Action] = []
     for service in (unit.service_path.name, unit.gw_service_path.name):
@@ -95,14 +96,16 @@ def remove_unit(system: System, name: str) -> list[Action] | None:
         actions.append(Action("rm", path, {}, "create"))
     if unit.created_user:
         # Raises on an unexpected failure, before the registry entry is dropped, so the
-        # unit can be removed again once whatever holds the account is gone.
+        # unit can be removed again once whatever holds the account is gone. Deleting
+        # `sa-NAME` takes its group with it, and with it Caddy's membership of it.
         for user in (unit.user, unit.gw_user):
             system.delete_user(user)
             actions.append(Action("rm", user, {"kind": "user"}, "create"))
-    registry.drop(system, name)
+    # The entry is dropped last: until daemon-reload and Caddy have both accepted the
+    # removal, `rm NAME` must stay repeatable rather than answer `not found`.
     system.systemctl("daemon-reload")
     system.caddy_reload()
     actions.append(Action("caddy_reload", "caddy", {}, "create"))
-    for directory in PRUNE_DIRS:
-        system.prune_empty(directory)
+    registry.drop(system, name)
+    system.prune_created()
     return actions

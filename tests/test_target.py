@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from smallapp.target import TargetError, detect
+from smallapp.target import TargetError, declares_dependencies, detect, reads_port
 
 APP = 'import os\nport = int(os.environ["PORT"])\n'
 
@@ -130,3 +130,41 @@ def test_plan_exits_2_on_a_comment_only_port(tmp_path: Path) -> None:
     )
     assert result.returncode == 2, result.stdout
     assert "PORT" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import os\nos.getenv(key="PORT")\n',
+        'import os\nos.getenv("PORT", "8000")\n',
+        'from os import getenv\ngetenv("PORT")\n',
+        'import os\nos.environ.get("PORT")\n',
+        'from os import environ\nenviron["PORT"]\n',
+        'import os\nos.environb[b"PORT"]\n',
+    ],
+)
+def test_real_environment_reads_are_accepted(source: str) -> None:
+    """QA round 6 #6: keyword and positional reads of the real `os` APIs all count."""
+    assert reads_port(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'Fake().getenv("PORT")\n',
+        'class Fake:\n    def getenv(self, k): ...\nFake().environ.get("PORT")\n',
+        'config.getenv("PORT")\n',
+        'settings.environ["PORT"]\n',
+        '"PORT"\n',
+    ],
+)
+def test_impostor_environment_reads_are_rejected(source: str) -> None:
+    """QA round 6 #6: a method merely named `getenv` does not serve on $PORT."""
+    assert not reads_port(source)
+
+
+def test_pep723_block_detection_needs_the_whole_block() -> None:
+    assert declares_dependencies('# /// script\n# dependencies = ["httpx"]\n# ///\n')
+    assert declares_dependencies("# /// script\n# requires-python = '>=3.11'\n# ///\n")
+    assert not declares_dependencies('"""a docstring saying # /// script"""\n')
+    assert not declares_dependencies("# /// script\n# dependencies = []\n")

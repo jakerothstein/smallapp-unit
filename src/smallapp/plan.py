@@ -6,12 +6,31 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .naming import Unit, ValidationError
-from .render import RenderedFile, render
-from .system import System
-from .target import Target
+from .render import (
+    MODE_APP_DIR,
+    MODE_STATE_DIR,
+    PYTHON_ENTRY,
+    RenderedFile,
+    render,
+    uv_cache_dir,
+)
+from .system import CADDY_USER, System
+from .target import Target, declares_dependencies
 from .tokens import generate_secret, generate_token, hash_token
 
-Verb = Literal["mkdir", "write", "chown", "chmod", "user", "systemctl", "caddy_reload", "rm"]
+Verb = Literal[
+    "mkdir",
+    "write",
+    "chown",
+    "chgrp",
+    "chmod",
+    "user",
+    "group",
+    "deps",
+    "systemctl",
+    "caddy_reload",
+    "rm",
+]
 State = Literal["create", "change", "unchanged"]
 
 MARK = {"create": "+", "change": "~", "unchanged": "="}
@@ -36,15 +55,23 @@ class Secrets:
     token: str | None  # plaintext, present only when freshly generated
 
 
-def resolve_secrets(system: System, unit: Unit) -> Secrets:
-    """Reuse the secrets already on disk, so a second apply changes nothing."""
-    raw = system.read(str(unit.env_path))
-    if raw is not None:
-        values = _parse_env(raw)
-        secret = values.get("SMALLAPP_SECRET", "")
-        token_hash = values.get("SMALLAPP_TOKEN_HASH", "")
-        if secret and token_hash:
-            return Secrets(secret=secret, token_hash=token_hash, token=None)
+def resolve_secrets(system: System, unit: Unit, known: Unit | None = None) -> Secrets:
+    """Reuse the secrets already on disk, so a second apply changes nothing.
+
+    Only a *finished* apply may reuse them. An interrupted first apply leaves an env
+    file whose plaintext token was never printed; reusing that hash would lock the
+    owner out of their own app with no way back except deleting the file by hand. So
+    unless the registry says the unit is complete, both secrets are generated afresh
+    and the retry prints a token that works.
+    """
+    if known is not None and known.complete:
+        raw = system.read(str(unit.env_path))
+        if raw is not None:
+            values = _parse_env(raw)
+            secret = values.get("SMALLAPP_SECRET", "")
+            token_hash = values.get("SMALLAPP_TOKEN_HASH", "")
+            if secret and token_hash:
+                return Secrets(secret=secret, token_hash=token_hash, token=None)
     token = generate_token()
     return Secrets(secret=generate_secret(), token_hash=hash_token(token), token=token)
 
@@ -68,6 +95,13 @@ def file_state(system: System, path: str, rendered: RenderedFile) -> State:
     return "change"
 
 
+def dir_state(system: System, absolute: str, mode: int) -> State:
+    """A directory is unchanged only when it exists *and* already carries `mode`."""
+    if not system.path(absolute).is_dir():
+        return "create"
+    return "unchanged" if system.mode_of(absolute) == mode else "change"
+
+
 def build(
     system: System, target: Target, unit: Unit, secrets: Secrets, known: Unit | None = None
 ) -> list[Action]:
@@ -88,9 +122,15 @@ def build(
                 f"— remove it, or deploy under a different --name."
             )
         actions.append(Action("user", user, {}, "unchanged" if exists else "create"))
-    for directory in (str(unit.app_dir), str(unit.state_dir), str(unit.gw_state_dir)):
-        exists = system.path(directory).is_dir()
-        actions.append(Action("mkdir", directory, {}, "unchanged" if exists else "create"))
+    directories = (
+        (str(unit.app_dir), MODE_APP_DIR),
+        (str(unit.state_dir), MODE_STATE_DIR),
+        (str(unit.gw_state_dir), MODE_STATE_DIR),
+    )
+    for directory, mode in directories:
+        actions.append(
+            Action("mkdir", directory, {"mode": f"0{mode:o}"}, dir_state(system, directory, mode))
+        )
     for path in sorted(files):
         rendered = files[path]
         actions.append(
@@ -103,6 +143,26 @@ def build(
         )
     for stale in stale_payload(system, unit, files):
         actions.append(Action("rm", stale, {}, "change"))
+    actions.extend(_dependency_actions(system, target, unit, actions))
+    actions.append(
+        Action(
+            "chgrp",
+            str(unit.app_dir),
+            {"group": unit.user},
+            "unchanged" if system.path(str(unit.app_dir)).is_dir() else "create",
+        )
+    )
+    if unit.kind == "static":
+        # Caddy serves these bytes itself, so it — and only it — joins the unit's group.
+        member = CADDY_USER in system.group_members(unit.user)
+        actions.append(
+            Action(
+                "group",
+                unit.user,
+                {"user": CADDY_USER},
+                "unchanged" if member else "create",
+            )
+        )
     owned = ((str(unit.state_dir), unit.user), (str(unit.gw_state_dir), unit.gw_user))
     for directory, owner in owned:
         actions.append(
@@ -121,6 +181,27 @@ def build(
         actions.append(Action("systemctl", service, {"verb": "enable --now"}, service_state))
     actions.append(Action("caddy_reload", "caddy", {}, service_state))
     return actions
+
+
+def _dependency_actions(
+    system: System, target: Target, unit: Unit, so_far: list[Action]
+) -> list[Action]:
+    """Pre-build a PEP 723 script's environment, because the unit gets no network.
+
+    Re-run whenever the payload changed or the cache is missing; `uv sync` is itself
+    idempotent, so the only cost of being wrong is a redundant resolve.
+    """
+    if target.kind != "python" or not declares_dependencies(
+        target.files[0].read_text(encoding="utf-8")
+    ):
+        return []
+    cache = uv_cache_dir(unit)
+    entry = str(unit.app_dir / PYTHON_ENTRY)
+    payload_changed = any(
+        action.target == entry and action.state != "unchanged" for action in so_far
+    )
+    fresh = system.path(cache).is_dir() and not payload_changed
+    return [Action("deps", entry, {"cache": cache}, "unchanged" if fresh else "create")]
 
 
 def stale_payload(system: System, unit: Unit, files: dict[str, RenderedFile]) -> list[str]:

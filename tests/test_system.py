@@ -56,20 +56,43 @@ def test_remove_handles_files_dirs_and_absences(tmp_path: Path) -> None:
     system.remove("/opt/smallapp/a")
 
 
-def test_prune_empty_stops_at_the_root(tmp_path: Path) -> None:
+def test_prune_created_removes_only_what_smallapp_made(tmp_path: Path) -> None:
     system = System(tmp_path)
     system.mkdir("/var/lib/smallapp/expenses")
-    system.prune_empty("/var/lib/smallapp/expenses")
+    system.prune_created()
     assert tmp_path.exists()
     assert not (tmp_path / "var").exists()
 
 
-def test_prune_empty_keeps_non_empty_dirs(tmp_path: Path) -> None:
+def test_prune_created_keeps_non_empty_dirs(tmp_path: Path) -> None:
     system = System(tmp_path)
     system.write("/var/lib/smallapp/keep.json", b"{}", 0o644)
     system.mkdir("/var/lib/smallapp/expenses")
-    system.prune_empty("/var/lib/smallapp/expenses")
+    system.prune_created()
     assert system.path("/var/lib/smallapp/keep.json").is_file()
+
+
+def test_prune_created_never_removes_a_pre_existing_directory(tmp_path: Path) -> None:
+    """QA round 6 #5: a directory smallapp found is a directory smallapp leaves."""
+    (tmp_path / "etc/caddy/smallapp.d").mkdir(parents=True)
+    system = System(tmp_path)
+    system.mkdir("/var/lib/smallapp")
+    system.prune_created()
+    assert (tmp_path / "etc/caddy/smallapp.d").is_dir()
+    assert not (tmp_path / "var").exists()
+
+
+def test_created_record_survives_into_another_process(tmp_path: Path) -> None:
+    first = System(tmp_path)
+    first.mkdir("/opt/smallapp/expenses")
+    first.mkdir("/var/lib/smallapp")
+    first.flush_created()
+
+    second = System(tmp_path)
+    second.remove("/opt/smallapp/expenses")
+    second.prune_created()
+    assert not (tmp_path / "opt").exists()
+    assert not (tmp_path / "var").exists()
 
 
 def test_prefixed_user_lifecycle_is_recorded(tmp_path: Path) -> None:

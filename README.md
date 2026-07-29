@@ -149,8 +149,7 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler).serve_forever()
 ```
 
-Dependencies go inline, [PEP 723](https://peps.python.org/pep-0723/) style, and `uv`
-installs them at start:
+Dependencies go inline, [PEP 723](https://peps.python.org/pep-0723/) style:
 
 ```python
 # /// script
@@ -158,7 +157,16 @@ installs them at start:
 # ///
 ```
 
-A file with no such header is run with plain `python3` and needs no network at all.
+`uv` resolves them **while `apply` runs**, into `/var/lib/smallapp/NAME/uv-cache`. The
+running unit is not allowed to talk to anything but loopback, so it starts with
+`uv run --offline` and never reaches the network. Change the dependencies, run `apply`
+again, and they are resolved again.
+
+A file with no such header is run with plain `python3` and needs no cache at all.
+
+A deployed app therefore has **no outbound network**. If your app has to call somebody
+else's API, v1 is the wrong tool — that trade is what makes the app unreachable from
+the internet no matter what address it binds.
 
 A static target is a directory containing `index.html`. That is the whole contract.
 
@@ -167,7 +175,7 @@ A static target is a directory containing `index.html`. That is the whole contra
 | Artifact | Path |
 | --- | --- |
 | unix users | `sa-NAME` (the app), `sa-NAME-gw` (the gateway) |
-| app payload | `/opt/smallapp/NAME/` |
+| app payload | `/opt/smallapp/NAME/` (`root:sa-NAME`, dir `0750`, files `0640`) |
 | writable state | `/var/lib/smallapp/NAME/`, `/var/lib/smallapp/NAME-gw/` |
 | secrets (0600) | `/etc/smallapp/NAME.env` |
 | services | `/etc/systemd/system/smallapp-NAME[-gw].service` |
@@ -178,15 +186,23 @@ The app service never sees the session secret or the token hash: only the gatewa
 reads `/etc/smallapp/NAME.env`, and it does so under **its own uid**, so app code
 cannot read the gateway's `/proc/PID/environ` and lift the cookie key out of it.
 Re-running `apply` reuses the secrets already on disk, so a second run reports
-`no changes` and does not print a new token.
+`no changes` and does not print a new token. An apply that was *interrupted* is a
+different matter: its token was never printed, so the retry generates a fresh one and
+shows it to you.
 
 ## What is and is not isolated
 
 Each unit is confined by systemd: no capabilities, a syscall filter, a read-only
 filesystem apart from its own state directory, a memory cap, and a uid of its own. An
-app can only bind its own port (`SocketBindDeny=any`), cannot see other users'
-processes (`ProtectProc=invisible`), and cannot reach Caddy's admin API once that is
-on a unix socket as the quickstart sets up.
+app can only bind its own port (`SocketBindDeny=any`), can only exchange packets with
+loopback (`IPAddressDeny=any` + `IPAddressAllow=localhost`, so binding `0.0.0.0` gains
+it nothing and the internet still has to come through Caddy and your cookie), cannot
+see other users' processes (`ProtectProc=invisible`), and cannot reach Caddy's admin
+API once that is on a unix socket as the quickstart sets up.
+
+Payloads are private per unit: `/opt/smallapp/NAME` is `root:sa-NAME` `0750`, so
+`sa-other` cannot read your source. Static sites are served by Caddy directly, so
+`caddy` is added to that one group — and to no other unit's.
 
 What is **not** isolated: apps share the host's loopback interface, so a deployed app
 can open a TCP connection to another unit's `127.0.0.1:18xxx` port. The auth boundary

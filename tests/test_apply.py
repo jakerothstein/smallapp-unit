@@ -17,8 +17,12 @@ from conftest import FIXED_SECRETS, make_unit, tree_hash
 from smallapp import registry
 from smallapp.apply import apply_unit, remove_unit
 from smallapp.naming import ValidationError
+from smallapp.plan import resolve_secrets
 from smallapp.system import StepError, System
 from smallapp.target import Target, detect
+from smallapp.tokens import verify_token
+
+NAMED = ("--name", "expenses", "--domain", "expenses.example.com")
 
 
 def test_apply_writes_every_artifact_with_the_right_mode(
@@ -314,3 +318,130 @@ def test_concurrent_first_applies_keep_both_units(tmp_path: Path, app_file: Path
     assert sorted(units) == sorted(names), "a concurrent apply lost a unit"
     ports = [unit.port for unit in units.values()]
     assert len(set(ports)) == len(ports), f"duplicate ports allocated: {ports}"
+
+
+# --- QA round 6 -------------------------------------------------------------
+
+
+def test_a_retry_after_a_partial_first_apply_still_yields_a_usable_token(
+    host: System, python_target: Target, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA round 6 #1: the env file exists but its plaintext token was never printed."""
+    unit = make_unit()
+    first = resolve_secrets(host, unit, registry.load(host).get(unit.name))
+    assert first.token is not None
+
+    def explode(self: System, caddyfile: str = "/etc/caddy/Caddyfile") -> None:
+        raise StepError("reload caddy", "caddy is not running")
+
+    monkeypatch.setattr(System, "caddy_reload", explode)
+    with pytest.raises(StepError):
+        apply_unit(host, python_target, unit, first)
+    assert host.path("/etc/smallapp/expenses.env").is_file()
+
+    monkeypatch.undo()
+    retry = resolve_secrets(host, unit, registry.load(host).get(unit.name))
+    assert retry.token is not None, "the retry printed no token the owner can use"
+    assert retry.token_hash != first.token_hash
+    _, token = apply_unit(host, python_target, unit, retry)
+    assert token == retry.token
+    assert verify_token(token, read_env_value(host, "SMALLAPP_TOKEN_HASH"))
+
+    settled = resolve_secrets(host, unit, registry.load(host).get(unit.name))
+    assert settled.token is None, "a finished unit must keep its secrets"
+    assert settled.token_hash == retry.token_hash
+
+
+def read_env_value(host: System, key: str) -> str:
+    raw = host.path("/etc/smallapp/expenses.env").read_text()
+    return next(line.split("=", 1)[1] for line in raw.splitlines() if line.startswith(f"{key}="))
+
+
+def test_a_failed_removal_can_be_retried(
+    host: System, python_target: Target, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA round 6 #4: the registry entry is the retry state; it goes last."""
+    apply_unit(host, python_target, make_unit(), FIXED_SECRETS)
+    reloads: list[str] = []
+
+    def first_reload_explodes(self: System, caddyfile: str = "/etc/caddy/Caddyfile") -> None:
+        reloads.append(caddyfile)
+        if len(reloads) == 1:
+            raise StepError("reload caddy", "caddy is not running")
+
+    monkeypatch.setattr(System, "caddy_reload", first_reload_explodes)
+    with pytest.raises(StepError, match="reload caddy"):
+        remove_unit(host, "expenses")
+    assert "expenses" in registry.load(host), "retry state was dropped before the failure"
+
+    assert remove_unit(host, "expenses") is not None
+    assert len(reloads) == 2
+    assert registry.load(host) == {}
+
+
+def test_rm_of_an_unknown_unit_keeps_pre_existing_directories(host: System) -> None:
+    """QA round 6 #5: `rm ghost` must change nothing at all."""
+    (host.root / "etc/caddy/smallapp.d").mkdir(parents=True)
+    (host.root / "opt/smallapp").mkdir(parents=True)
+    before = tree_hash(host.root)
+    with host.lock():
+        assert remove_unit(host, "ghost") is None
+    assert tree_hash(host.root) == before
+
+
+def test_rm_leaves_directories_it_did_not_create(tmp_path: Path, app_file: Path) -> None:
+    """QA round 6 #5: a known unit's removal still spares pre-existing directories."""
+    root = tmp_path / "root"
+    (root / "etc/caddy/smallapp.d").mkdir(parents=True)
+    before = tree_hash(root)
+    assert run_cli("apply", str(app_file), *NAMED, "--root", str(root)).returncode == 0
+    assert run_cli("rm", "expenses", "--root", str(root)).returncode == 0
+    assert (root / "etc/caddy/smallapp.d").is_dir(), "removed a directory it did not create"
+    assert tree_hash(root) == before
+
+
+def test_payload_is_readable_only_by_its_own_unit(host: System, python_target: Target) -> None:
+    """QA round 6 #3: 0640 in a 0750 directory, group `sa-NAME`."""
+    actions, _ = apply_unit(host, python_target, make_unit(), FIXED_SECRETS)
+    assert host.mode_of("/opt/smallapp/expenses") == 0o750
+    assert host.mode_of("/opt/smallapp/expenses/app.py") == 0o640
+    chgrp = [a for a in actions if a.verb == "chgrp"]
+    assert [a.target for a in chgrp] == ["/opt/smallapp/expenses"]
+    assert chgrp[0].detail["group"] == "sa-expenses"
+    assert [a for a in actions if a.verb == "group"] == [], "a python unit needs no reader"
+
+
+def test_static_payload_grants_caddy_and_nobody_else(host: System, static_target: Target) -> None:
+    """QA round 6 #3: Caddy joins the unit's own group, not every unit's."""
+    unit = make_unit(kind="static", name="notes")
+    actions, _ = apply_unit(host, static_target, unit, FIXED_SECRETS)
+    assert host.mode_of("/opt/smallapp/notes") == 0o750
+    assert host.mode_of("/opt/smallapp/notes/index.html") == 0o640
+    group = [a for a in actions if a.verb == "group"]
+    assert [(a.target, a.detail["user"]) for a in group] == [("sa-notes", "caddy")]
+    assert host.group_members("sa-notes") == {"caddy"}
+
+    again, _ = apply_unit(host, static_target, unit, FIXED_SECRETS)
+    assert [a for a in again if a.verb == "group"][0].state == "unchanged"
+
+
+def test_a_pep723_app_has_its_dependencies_installed_at_apply(
+    host: System, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA round 6 #2: the unit may only talk to loopback, so uv must resolve here."""
+    script = tmp_path / "deps.py"
+    script.write_text('# /// script\n# dependencies = []\n# ///\nimport os\nos.environ["PORT"]\n')
+    synced: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        System,
+        "uv_sync_script",
+        lambda self, s, cache: synced.append((s, cache)),
+    )
+    unit = make_unit()
+    apply_unit(host, detect(script), unit, FIXED_SECRETS)
+    assert synced == [("/opt/smallapp/expenses/app.py", "/var/lib/smallapp/expenses/uv-cache")]
+
+    host.path("/var/lib/smallapp/expenses/uv-cache").mkdir(parents=True)
+    actions, _ = apply_unit(host, detect(script), unit, FIXED_SECRETS)
+    assert [a for a in actions if a.verb == "deps"][0].state == "unchanged"
+    assert len(synced) == 1, "an unchanged payload re-resolved its dependencies"
