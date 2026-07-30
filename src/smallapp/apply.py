@@ -45,15 +45,18 @@ def apply_unit(
         elif action.verb == "rm":
             system.remove(action.target)
         elif action.verb == "deps":
-            system.uv_sync_script(action.target, action.detail["cache"])
+            system.uv_sync_script(action.target, action.detail["cache"], action.detail["marker"])
         elif action.verb == "chown":
             system.chown(action.target, action.detail["user"])
         elif action.verb == "chgrp":
             system.chgrp(action.target, action.detail["group"])
         elif action.verb == "group":
-            system.add_group_member(action.target, action.detail["user"])
+            if action.detail.get("op") == "remove":
+                system.remove_group_member(action.target, action.detail["user"])
+            else:
+                system.add_group_member(action.target, action.detail["user"])
             # Supplementary groups are read once, at process start: Caddy has to be
-            # restarted, not reloaded, before it can read this unit's payload.
+            # restarted, not reloaded, before the change takes effect.
             system.systemctl("restart", "caddy")
         elif action.verb == "systemctl":
             if action.target == "daemon-reload":

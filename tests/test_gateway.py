@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import http.client
 import inspect
+import socket
 import subprocess
 import sys
 import threading
@@ -284,3 +285,51 @@ def test_logout_outside_the_contract_is_405_and_touches_no_cookie(gw: int, metho
     assert "Set-Cookie" not in headers
     # The session survives a method that was refused.
     assert request(gw, "GET", "/_smallapp/auth", cookie=cookie)[0] == 204
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "expected"),
+    [
+        ("POST", "/_smallapp/login", b"token=" + b"a" * 9000, 401),  # oversized login
+        ("POST", "/_smallapp/login", b"token=wrong", 401),  # wrong token
+        ("GET", "/_smallapp/auth", b"", 401),  # auth challenge
+        ("GET", "/_smallapp/logout", b"x" * 200, 405),  # method not allowed
+        ("POST", "/_smallapp/nope", b"y" * 200, 404),  # unknown gateway route
+        ("POST", "/app", b"z" * 200, 401),  # unauthorised proxy, body never forwarded
+    ],
+)
+def test_a_rejected_request_cannot_bleed_into_the_next_one(
+    gw: int, method: str, path: str, body: bytes, expected: int
+) -> None:
+    """QA round 8 #1: an undrained body on a keep-alive connection is parsed as the
+    next request. Every rejection must consume its body or close the connection."""
+    conn = http.client.HTTPConnection("127.0.0.1", gw, timeout=10)
+    try:
+        conn.request(
+            method, path, body=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        first = conn.getresponse()
+        first.read()
+        assert first.status == expected
+        conn.request("GET", "/_smallapp/login")
+        second = conn.getresponse()
+        page = second.read()
+        assert second.status == 200, f"{path} left {len(body)} bytes on the connection"
+        assert b'name="token"' in page
+    finally:
+        conn.close()
+
+
+def test_an_unreadable_body_is_refused_and_the_connection_closed(gw: int) -> None:
+    """A body the gateway cannot frame exactly (bad length, chunked) cannot be drained,
+    so the only safe answer is to refuse and hang up."""
+    for header in (b"Content-Length: not-a-number", b"Transfer-Encoding: chunked"):
+        sock = socket.create_connection(("127.0.0.1", gw), timeout=10)
+        try:
+            sock.sendall(b"POST /app HTTP/1.1\r\nHost: x\r\n" + header + b"\r\n\r\n")
+            seen = b""
+            while chunk := sock.recv(4096):
+                seen += chunk
+            assert seen.startswith(b"HTTP/1.1 413 "), seen[:60]
+        finally:
+            sock.close()

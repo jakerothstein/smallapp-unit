@@ -435,13 +435,61 @@ def test_a_pep723_app_has_its_dependencies_installed_at_apply(
     monkeypatch.setattr(
         System,
         "uv_sync_script",
-        lambda self, s, cache: synced.append((s, cache)),
+        lambda self, s, cache, marker: synced.append((s, cache)),
     )
     unit = make_unit()
     apply_unit(host, detect(script), unit, FIXED_SECRETS)
     assert synced == [("/opt/smallapp/expenses/app.py", "/var/lib/smallapp/expenses/uv-cache")]
 
-    host.path("/var/lib/smallapp/expenses/uv-cache").mkdir(parents=True)
+    host.write("/var/lib/smallapp/expenses/uv-cache/.synced", b"", 0o600)
     actions, _ = apply_unit(host, detect(script), unit, FIXED_SECRETS)
     assert [a for a in actions if a.verb == "deps"][0].state == "unchanged"
     assert len(synced) == 1, "an unchanged payload re-resolved its dependencies"
+
+
+def test_a_failed_dependency_sync_is_retried_and_never_marked_complete(
+    host: System, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA round 8 #2: the cache directory exists before `uv sync` runs, so it is not
+    proof of a successful resolve. Only the marker written afterwards is."""
+    script = tmp_path / "deps.py"
+    script.write_text('# /// script\n# dependencies = []\n# ///\nimport os\nos.environ["PORT"]\n')
+    attempts: list[str] = []
+
+    def sync(self: System, s: str, cache: str, marker: str) -> None:
+        attempts.append(s)
+        self.mkdir(cache, 0o700)  # what the real implementation does before resolving
+        if len(attempts) == 1:
+            raise StepError("uv sync", "resolver exploded")
+        self.write(marker, b"", 0o600)
+
+    monkeypatch.setattr(System, "uv_sync_script", sync)
+    unit = make_unit()
+    with pytest.raises(StepError):
+        apply_unit(host, detect(script), unit, FIXED_SECRETS)
+    assert registry.load(host)["expenses"].complete is False
+
+    actions, _ = apply_unit(host, detect(script), unit, FIXED_SECRETS)
+    assert [a.state for a in actions if a.verb == "deps"] == ["create"]
+    assert len(attempts) == 2, "a failed sync was reported as done on retry"
+    assert registry.load(host)["expenses"].complete is True
+
+
+def test_switching_a_static_unit_to_python_revokes_caddys_group_membership(
+    host: System, static_target: Target, python_target: Target
+) -> None:
+    """QA round 8 #3: Caddy must not keep read access to a payload it no longer serves."""
+    static = make_unit(kind="static", name="notes")
+    apply_unit(host, static_target, static, FIXED_SECRETS)
+    assert host.group_members("sa-notes") == {"caddy"}
+
+    python = make_unit(name="notes")
+    actions, _ = apply_unit(host, python_target, python, FIXED_SECRETS)
+    group = [a for a in actions if a.verb == "group"]
+    assert [(a.target, a.detail["user"], a.detail["op"]) for a in group] == [
+        ("sa-notes", "caddy", "remove")
+    ]
+    assert host.group_members("sa-notes") == set()
+
+    again, _ = apply_unit(host, python_target, python, FIXED_SECRETS)
+    assert [a for a in again if a.verb == "group"] == [], "revocation is not idempotent"

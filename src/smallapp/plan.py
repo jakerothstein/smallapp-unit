@@ -13,6 +13,7 @@ from .render import (
     RenderedFile,
     render,
     uv_cache_dir,
+    uv_sync_marker,
 )
 from .system import CADDY_USER, System
 from .target import Target, declares_dependencies
@@ -159,10 +160,13 @@ def build(
             Action(
                 "group",
                 unit.user,
-                {"user": CADDY_USER},
+                {"user": CADDY_USER, "op": "add"},
                 "unchanged" if member else "create",
             )
         )
+    elif CADDY_USER in system.group_members(unit.user):
+        # Was static, is not any more: Caddy must lose its read access to the payload.
+        actions.append(Action("group", unit.user, {"user": CADDY_USER, "op": "remove"}, "change"))
     owned = ((str(unit.state_dir), unit.user), (str(unit.gw_state_dir), unit.gw_user))
     for directory, owner in owned:
         actions.append(
@@ -196,12 +200,17 @@ def _dependency_actions(
     ):
         return []
     cache = uv_cache_dir(unit)
+    marker = uv_sync_marker(unit)
     entry = str(unit.app_dir / PYTHON_ENTRY)
     payload_changed = any(
         action.target == entry and action.state != "unchanged" for action in so_far
     )
-    fresh = system.path(cache).is_dir() and not payload_changed
-    return [Action("deps", entry, {"cache": cache}, "unchanged" if fresh else "create")]
+    fresh = system.path(marker).is_file() and not payload_changed
+    return [
+        Action(
+            "deps", entry, {"cache": cache, "marker": marker}, "unchanged" if fresh else "create"
+        )
+    ]
 
 
 def stale_payload(system: System, unit: Unit, files: dict[str, RenderedFile]) -> list[str]:

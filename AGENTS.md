@@ -19,9 +19,9 @@ Requires `uv` (https://docs.astral.sh/uv/) and Python >= 3.11. No other setup.
 | Test | `uv run pytest` |
 | Test (one file) | `uv run pytest tests/test_gateway.py` |
 | Test (fast only) | `uv run pytest -m "not slow"` (skips the subprocess e2e tests) |
-| Test (slow only) | `uv run pytest -m slow` (real subprocesses; one needs network) |
+| Test (slow only) | `uv run pytest -m slow` (real subprocesses; needs network + docker) |
 | Refresh golden files | `UPDATE_GOLDEN=1 uv run pytest tests/test_render.py` |
-| Test (needs network) | `uv run pytest -m slow` — two of them resolve real packages |
+| Test (needs network) | `uv run pytest -m slow` — two resolve real packages, one pulls `debian:bookworm-slim` |
 | Deploy into a prefix | `uv run smallapp apply APP.py --name n --domain n.example.com --root /tmp/h` |
 | Lint | `uv run ruff check .` |
 | Format check | `uv run ruff format --check .` |
@@ -63,8 +63,9 @@ Never hardcode any of these. Never commit a generated `.env`.
 ## Host targets
 
 The CLI runs and is fully tested on macOS and Linux. It only *applies* to Linux with
-systemd + Caddy. Tests that need real systemd (`tests/test_hardening.py`) skip with an
-explicit reason elsewhere; they must never pass vacuously.
+systemd + Caddy. `tests/test_hardening.py` (criterion 26) runs natively on Linux and
+otherwise inside `debian:bookworm-slim` via docker, so it only skips on a host with
+neither. It must never pass vacuously.
 
 Use `--root DIR` to apply into a prefix without root. That is how the end-to-end test
 works, and it is the only supported way to test apply on a laptop. Under a prefix,
@@ -95,5 +96,12 @@ marker files in `<root>/var/lib/smallapp/users/`.
   anything under `/root` is unreachable to it.
 - `python` is not on PATH here. Always `uv run python`.
 
-`systemd-analyze security` (criterion 26) has only ever skipped on macOS. On a Linux
-box run `uv run pytest tests/test_hardening.py` and confirm it does not skip.
+`systemd-analyze security --offline=true` prints the overall score only in its human
+output: `--json=short` gives per-setting rows whose `exposure` is `null`. Criterion 26
+therefore parses "Overall exposure level for X: N". Both units currently score 0.9 SAFE
+against a 4.0 limit; `uv run pytest tests/test_hardening.py -rs` reproduces it anywhere
+docker runs.
+
+The gateway reads the whole request body once, in `_route`, before dispatch. Any new
+branch must use `self.body` — reading `self.rfile` a second time, or answering without
+draining, desynchronises the next request on a keep-alive connection.

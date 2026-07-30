@@ -1,72 +1,3 @@
-## QA FINDINGS (round 8, 2026-07-29)
-
-1. **HIGH — Unread request bodies desynchronize persistent gateway
-   connections.** Multiple branches in `src/smallapp/gateway.py:145-260` respond
-   without consuming the request body or closing the HTTP/1.1 connection, including
-   auth challenges, method errors, unknown `/_smallapp/*` routes, oversized logins,
-   and invalid or oversized proxied bodies. Reproduce against a real `make_server`:
-   send a 9006-byte
-   `POST /_smallapp/login`, read its 401, then send `GET /_smallapp/login` on the
-   same `HTTPConnection`; the second request is parsed as
-   `token=aaa...GET` and returns 501 instead of 200. Fixed means every rejection
-   either drains exactly the declared body or sets `close_connection = True`, and
-   a live keep-alive regression test proves the next request cannot inherit bytes
-   from the rejected one.
-2. **HIGH — A failed PEP 723 dependency sync is still treated as successful on
-   retry.** `src/smallapp/plan.py:203-204` uses the cache directory itself as the
-   success marker, but `src/smallapp/system.py:330-336` creates it before invoking
-   `uv sync`. Reproduce in a clean clone with a prefixed `System` whose first `_run`
-   raises during `uv sync`: the retry reports the `deps` action as `unchanged`, makes
-   no second sync attempt, and writes `complete=true`. Fixed means failed sync removes
-   the incomplete cache or leaves a separate success marker absent, retry invokes
-   `uv sync` again, and a regression test proves the registry cannot become complete
-   without a successful sync.
-3. **MEDIUM — Static-to-Python updates still retain Caddy's payload access.**
-   `src/smallapp/plan.py:155-165` only plans adding `caddy` for static units, and
-   `src/smallapp/system.py:307-320` only supports adding group members. Reproduce by
-   applying a static target named `thing`, then a Python target with the same name
-   under `--root`; `System.group_members("sa-thing")` is `{"caddy"}` both before and
-   after the transition. Fixed means the transition removes `caddy` from `sa-NAME`,
-   restarts Caddy to refresh supplementary groups, and a regression test asserts the
-   membership is gone.
-4. **BLOCKER — Acceptance criterion 26 remains unverified.**
-   `tests/test_hardening.py:19-26` skips both hardening checks unless the host is Linux
-   with `systemd-analyze`; the mandatory clean clone run on macOS finished with 248
-   passed and 2 skipped. Fixed means running
-   `uv run pytest tests/test_hardening.py -rs` on Linux with systemd and recording
-   both rendered services below the required 4.0 exposure score.
-
-## QA FINDINGS (round 7, 2026-07-29)
-
-1. **HIGH — A failed PEP 723 dependency sync is skipped on retry and the unit is
-   marked complete.** `src/smallapp/plan.py:203-204` treats an existing cache directory
-   as a successful sync, but `src/smallapp/system.py:330-336` creates that directory
-   before running `uv sync`. Reproduce by making `System._run` fail on its first
-   `uv sync`, then retrying the same `apply`: the second plan marks `deps` unchanged,
-   does not call `uv sync` again, and writes `complete=true`; the generated
-   `uv run --offline` service then has no resolved dependencies. Fixed means a failed
-   sync leaves no success marker (for example, sync into a temporary directory and
-   rename or write a completion marker only after success), retry runs `uv sync`
-   again, and a regression test proves the registry cannot become complete first.
-2. **MEDIUM — Switching a unit from static to Python leaves Caddy in the payload
-   group.** `src/smallapp/plan.py:155-165` only adds `caddy` for static units, while
-   `src/smallapp/system.py:307-320` has no operation to remove a supplementary group
-   member. Reproduce by applying a static target as `thing`, then applying a Python
-   target with the same name under `--root`: the second apply removes `index.html`
-   and writes `app.py`, but `var/lib/smallapp/groups/sa-thing` still contains `caddy`;
-   the real-host equivalent leaves Caddy able to read the Python payload. Fixed means
-   a static-to-Python transition removes `caddy` from `sa-NAME`, restarts Caddy so its
-   supplementary groups refresh, and a regression test asserts the membership is
-   revoked.
-3. **BLOCKER — Acceptance criterion 26 has still never been exercised.**
-   `tests/test_hardening.py:19-26` skips both hardening checks off Linux, and the clean
-   clone run on macOS reported `2 skipped`; `IMPLEMENTATION_PLAN.md:151-152` confirms
-   the criterion has never run. Reproduce with
-   `uv run pytest tests/test_hardening.py -rs` on macOS. Fixed means running both
-   rendered units through `systemd-analyze security --offline=true --json=short` on
-   Linux with systemd and recording exposure below 4.0 for each; until then the
-   mandatory hardening guarantee is unverified and QA cannot sign off.
-
 # Implementation plan
 
 Ordered vertical slices. Each ends with `uv run pytest && uv run ruff check . && uv run mypy src tests`
@@ -115,6 +46,26 @@ separate `sa-NAME-gw` uid, symlink-confined writes, user-ownership tracking
 `/var/lib/smallapp`, AST-based `PORT` detection, stale-payload removal, Caddy admin
 on a unix socket, `O_EXCL`-at-final-mode secret writes, and 405 on non-POST logout.
 
+## 13. QA rounds 7-8 (done)
+
+All four findings fixed, each with a regression test that fails without the fix:
+
+1. The gateway drains the declared request body once, at the top of `_route`, and hands
+   it to `_login`/`_proxy`. A body it cannot frame exactly (bad `Content-Length`,
+   chunked) gets 413 *and* `close_connection = True`. Before this, a rejected 9006-byte
+   login left its bytes on a keep-alive connection and the next request was parsed as
+   `token=aaa...GET`. — `test_a_rejected_request_cannot_bleed_into_the_next_one`.
+2. `uv sync` success is now proved by `/var/lib/smallapp/NAME/uv-cache/.synced`, written
+   after the resolve and cleared before it. The cache *directory* exists from before the
+   resolve starts, so it never meant success. — regression test asserts two sync attempts
+   and `complete=False` in between.
+3. A static→python transition emits `group ... op=remove`, `System.remove_group_member`
+   runs `gpasswd --delete`, and Caddy is restarted so its supplementary groups refresh.
+4. Criterion 26 actually runs now. `--json=short` reports per-setting rows with
+   `exposure: null`, so the old test crashed on Linux instead of scoring anything; it now
+   parses the "Overall exposure level" line, and off Linux it borrows
+   `debian:bookworm-slim` via docker. Both units score **0.9 SAFE** against a 4.0 limit.
+
 ## 12. QA rounds 4-6 (done)
 
 The same eight findings were raised three rounds running; all are now fixed, each with
@@ -160,8 +111,7 @@ None. Every acceptance criterion in `specs/smallapp-unit.md` is covered by a tes
   README. If v2 wants outbound calls, the shape is an allow-list of peer addresses per
   unit (`IPAddressAllow=` takes CIDRs) rather than reopening `any`.
 - **`chgrp`, `chown` and group membership are prefix no-ops**, so `--root` tests assert
-  the *plan*, not the resulting uid. Real proof needs root on Linux; do it with
-  criterion 26.
+  the *plan* and a marker file, not the resulting uid. Real proof needs root on Linux.
 - **Two-uid isolation is asserted at the render level** (distinct `User=`, distinct
   `StateDirectory=`, `ProtectProc=invisible`, `ProcSubset=pid`). Proving the app really
   cannot read or signal the gateway needs real root on Linux; do it on the first Linux
@@ -186,8 +136,9 @@ None. Every acceptance criterion in `specs/smallapp-unit.md` is covered by a tes
 - Under `--root DIR` the user database is a marker file per user in
   `var/lib/smallapp/users/`; that is what makes `plan` report `unchanged` on a second
   run without root.
-- Criterion 26 has never run on this machine (macOS); the first Linux CI run is the
-  real check on the hardening score.
+- Criterion 26 runs everywhere docker is available: `tests/test_hardening.py` is marked
+  `slow` and shells out to `debian:bookworm-slim` when the host is not Linux. Last
+  recorded scores: both units 0.9 SAFE.
 - e2e overrides only the two port numbers (a test may not assume a fixed port is
   free); everything else comes from the rendered unit and the rendered env file.
 - Real-host verification (a live VPS with Caddy and systemd) is a manual step

@@ -123,6 +123,7 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
     protocol_version = "HTTP/1.1"
     config: Config
+    body: bytes = b""
 
     def do_GET(self) -> None:
         self._route()
@@ -143,6 +144,15 @@ class Handler(BaseHTTPRequestHandler):
         self._route()
 
     def _route(self) -> None:
+        # Drain the request body once, up front. Every branch below answers without
+        # reading it, and an undrained body on a keep-alive connection would be parsed
+        # as the *next* request.
+        body = self._read_body()
+        if body is None:
+            self.close_connection = True
+            self._send(413, b"request too large", "text/plain; charset=utf-8")
+            return
+        self.body = body
         path = urllib.parse.urlsplit(self.path).path
         if path == AUTH_PATH:
             self._auth()
@@ -200,12 +210,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, page, "text/html; charset=utf-8")
 
     def _login(self) -> None:
-        length = self._content_length()
-        if length is None or length > MAX_LOGIN_BODY:
+        if len(self.body) > MAX_LOGIN_BODY:
             self._login_form(401, "Invalid request.")
             return
-        raw = self.rfile.read(length)
-        fields = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        fields = urllib.parse.parse_qs(self.body.decode("utf-8", "replace"))
         token = (fields.get("token") or [""])[0]
         if not token or not verify_token(token, self.config.token_hash):
             self._login_form(401, "That token is not right.")
@@ -241,23 +249,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._write(body)
 
-    def _content_length(self) -> int | None:
+    def _read_body(self) -> bytes | None:
+        """The whole declared body, or None when it cannot be read exactly.
+
+        Chunked bodies count as unreadable: this gateway speaks only Content-Length, and
+        guessing at framing is how a connection ends up desynchronised.
+        """
+        if self.headers.get("Transfer-Encoding"):
+            return None
         raw = self.headers.get("Content-Length", "0")
         try:
             length = int(raw)
         except ValueError:
             return None
-        return length if 0 <= length <= MAX_PROXY_BODY else None
+        if not 0 <= length <= MAX_PROXY_BODY:
+            return None
+        body = self.rfile.read(length) if length else b""
+        return body if len(body) == length else None
 
     def _proxy(self) -> None:
         if self._subject() is None:
             self._challenge()
             return
-        length = self._content_length()
-        if length is None:
-            self._send(413, b"request too large", "text/plain; charset=utf-8")
-            return
-        body = self.rfile.read(length) if length else b""
+        body = self.body
         headers = {
             key: value for key, value in self.headers.items() if key.lower() not in HOP_BY_HOP
         }

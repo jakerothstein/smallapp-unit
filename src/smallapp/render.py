@@ -17,6 +17,7 @@ APP_MEMORY_MAX = "512M"
 GW_MEMORY_MAX = "128M"
 PYTHON_ENTRY = "app.py"
 UV_CACHE_SUFFIX = "uv-cache"
+UV_SYNC_MARKER = ".synced"
 
 MODE_FILE = 0o644
 MODE_PAYLOAD = 0o640  # root:sa-NAME — no other unit's uid may read it
@@ -38,6 +39,12 @@ class RenderedFile:
 def uv_cache_dir(unit: Unit) -> str:
     """Where a PEP 723 unit's pre-built environment lives: inside its own state dir."""
     return str(unit.state_dir / UV_CACHE_SUFFIX)
+
+
+def uv_sync_marker(unit: Unit) -> str:
+    """Written only after `uv sync` succeeds; the cache directory itself is not proof,
+    because it exists from the moment the failing sync was launched."""
+    return str(unit.state_dir / UV_CACHE_SUFFIX / UV_SYNC_MARKER)
 
 
 def exec_start(target: Target, unit: Unit) -> str:

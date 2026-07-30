@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 USERADD = "/usr/sbin/useradd"
 USERDEL = "/usr/sbin/userdel"
 USERMOD = "/usr/sbin/usermod"
+GPASSWD = "/usr/bin/gpasswd"
 USERDEL_NO_SUCH_USER = 6  # userdel(8): "specified user doesn't exist"
 SYSTEMCTL = "systemctl"
 CADDY = "caddy"
@@ -319,21 +320,44 @@ class System:
             return
         self._run(f"add {user} to group {group}", [USERMOD, "--append", "--groups", group, user])
 
-    def uv_sync_script(self, script: str, cache_dir: str) -> None:
+    def remove_group_member(self, group: str, user: str) -> None:
+        """Revoke a supplementary membership, e.g. when a unit stops being static.
+
+        Not an error if the membership is already gone: apply must stay retryable.
+        """
+        if self.prefixed:
+            marker = self.root / GROUP_MARKER_DIR / group
+            members = self.group_members(group) - {user}
+            if not marker.parent.is_dir() and not members:
+                return
+            self.mkdir_p(marker.parent)
+            marker.write_text("\n".join(sorted(members)) + "\n" if members else "")
+            return
+        if user not in self.group_members(group):
+            return
+        self._run(f"remove {user} from group {group}", [GPASSWD, "--delete", user, group])
+
+    def uv_sync_script(self, script: str, cache_dir: str, marker: str) -> None:
         """Pre-build a PEP 723 script's environment, so the running unit needs no network.
 
         The app service denies every non-loopback address, which is what stops untrusted
         app code from being reachable around Caddy. That also means `uv` cannot resolve
         anything at start-up, so resolution happens here, at apply time, into a cache the
         unit can read.
+
+        `marker` is written only once `uv sync` has returned successfully, and cleared
+        first: the cache directory exists from before the resolve starts, so its presence
+        never means the resolve finished.
         """
         cache = self.path(cache_dir)
         self.mkdir_p(cache)
+        self.remove(marker)
         self._run(
             f"install dependencies for {script}",
             [UV, "sync", "--script", str(self.path(script))],
             env={"UV_CACHE_DIR": str(cache)},
         )
+        self.write(marker, b"", 0o600)
 
     def systemctl(self, *args: str) -> None:
         if self.prefixed:
