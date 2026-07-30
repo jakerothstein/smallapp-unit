@@ -1,3 +1,41 @@
+## QA FINDINGS (round 8, 2026-07-29)
+
+1. **HIGH — Unread request bodies desynchronize persistent gateway
+   connections.** Multiple branches in `src/smallapp/gateway.py:145-260` respond
+   without consuming the request body or closing the HTTP/1.1 connection, including
+   auth challenges, method errors, unknown `/_smallapp/*` routes, oversized logins,
+   and invalid or oversized proxied bodies. Reproduce against a real `make_server`:
+   send a 9006-byte
+   `POST /_smallapp/login`, read its 401, then send `GET /_smallapp/login` on the
+   same `HTTPConnection`; the second request is parsed as
+   `token=aaa...GET` and returns 501 instead of 200. Fixed means every rejection
+   either drains exactly the declared body or sets `close_connection = True`, and
+   a live keep-alive regression test proves the next request cannot inherit bytes
+   from the rejected one.
+2. **HIGH — A failed PEP 723 dependency sync is still treated as successful on
+   retry.** `src/smallapp/plan.py:203-204` uses the cache directory itself as the
+   success marker, but `src/smallapp/system.py:330-336` creates it before invoking
+   `uv sync`. Reproduce in a clean clone with a prefixed `System` whose first `_run`
+   raises during `uv sync`: the retry reports the `deps` action as `unchanged`, makes
+   no second sync attempt, and writes `complete=true`. Fixed means failed sync removes
+   the incomplete cache or leaves a separate success marker absent, retry invokes
+   `uv sync` again, and a regression test proves the registry cannot become complete
+   without a successful sync.
+3. **MEDIUM — Static-to-Python updates still retain Caddy's payload access.**
+   `src/smallapp/plan.py:155-165` only plans adding `caddy` for static units, and
+   `src/smallapp/system.py:307-320` only supports adding group members. Reproduce by
+   applying a static target named `thing`, then a Python target with the same name
+   under `--root`; `System.group_members("sa-thing")` is `{"caddy"}` both before and
+   after the transition. Fixed means the transition removes `caddy` from `sa-NAME`,
+   restarts Caddy to refresh supplementary groups, and a regression test asserts the
+   membership is gone.
+4. **BLOCKER — Acceptance criterion 26 remains unverified.**
+   `tests/test_hardening.py:19-26` skips both hardening checks unless the host is Linux
+   with `systemd-analyze`; the mandatory clean clone run on macOS finished with 248
+   passed and 2 skipped. Fixed means running
+   `uv run pytest tests/test_hardening.py -rs` on Linux with systemd and recording
+   both rendered services below the required 4.0 exposure score.
+
 ## QA FINDINGS (round 7, 2026-07-29)
 
 1. **HIGH — A failed PEP 723 dependency sync is skipped on retry and the unit is
