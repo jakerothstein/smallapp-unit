@@ -1,3 +1,28 @@
+## QA FINDINGS (round 9, 2026-07-29)
+
+1. **Critical — interrupted applies permanently skip payload/state ownership.**
+   `src/smallapp/plan.py:148-155` and `src/smallapp/plan.py:170-179` mark `chgrp`
+   and `chown` unchanged whenever the directory exists; `src/smallapp/apply.py:35-37`
+   then skips them. Reproduce with a PEP 723 target by failing `uv sync` on the first
+   apply: the directories exist before ownership runs, and the retry reports every
+   ownership action unchanged, marks the unit complete, and never calls `chgrp` or
+   `chown`. On a real host the `0750` payload can remain inaccessible to `sa-NAME`.
+   Fixed means a retry detects or safely reapplies incorrect/unknown UID and GID, with
+   a regression test that fails after directory creation but before ownership and
+   proves the retry executes both ownership operations before marking the unit complete.
+
+2. **High — duplicate Content-Length headers desynchronise gateway keep-alive
+   connections.** `src/smallapp/gateway.py:252-268` reads only
+   `self.headers.get("Content-Length")`, which returns the first value when duplicates
+   are present. Reproduce over one raw TCP connection by sending a POST with
+   `Content-Length: 5`, `Content-Length: 100`, and 100 body bytes, then a valid
+   `GET /_smallapp/login`: the gateway reads five bytes and parses the remaining 95 as
+   the next request method, returning 501. This violates acceptance criterion 34 and is
+   reachable directly from another untrusted app over shared loopback. Fixed means the
+   gateway rejects every duplicate Content-Length as ambiguous, returns 413, closes the
+   connection, and has a raw-socket regression test proving no bytes reach a subsequent
+   request.
+
 # Implementation plan
 
 Ordered vertical slices. Each ends with `uv run pytest && uv run ruff check . && uv run mypy src tests`
