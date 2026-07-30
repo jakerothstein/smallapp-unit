@@ -94,7 +94,11 @@ a named regression test, and criteria 29-33 were added to the spec so they stay 
 
 ## Open items
 
-None. Every acceptance criterion in `specs/smallapp-unit.md` is covered by a test.
+None. Every acceptance criterion in `specs/smallapp-unit.md` is covered by a test,
+including the two added in round 8 (34: gateway keep-alive framing —
+`tests/test_gateway.py::test_a_rejected_request_cannot_bleed_into_the_next_one`;
+35: sync-failure retry —
+`tests/test_apply.py::test_a_failed_dependency_sync_is_retried_and_never_marked_complete`).
 
 ## Known limits (documented, not bugs)
 

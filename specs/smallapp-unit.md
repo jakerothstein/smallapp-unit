@@ -362,9 +362,11 @@ Every item is checkable by `pytest` or by a command's exit code.
     exits 0.
 25. `smallapp plan` on an invalid target exits **2** (not 1), asserted via
     `subprocess.run(...).returncode`.
-26. **Hardening (Linux+systemd only, skipped elsewhere with an explicit reason):**
-    `systemd-analyze security --json=short` on both rendered units reports exposure
-    < 4.0.
+26. **Hardening:** `systemd-analyze security --offline=true` on both rendered units
+    reports an overall exposure < 4.0. It runs natively on Linux with systemd and
+    otherwise inside a Linux container, so it skips only on a host with neither systemd
+    nor docker. (`--json=short` reports per-setting rows whose `exposure` is `null`; the
+    overall score exists only in the human output, so that is what is parsed.)
 27. `grep -rn "TODO\|FIXME\|XXX\|NotImplementedError" src/` returns no matches; a
     test asserts this over the shipped package.
 28. `README.md` contains a copy-pasteable quickstart; a test asserts every fenced
@@ -374,7 +376,8 @@ Every item is checkable by `pytest` or by a command's exit code.
     none and keeps both secrets.
 30. The rendered payload is mode `0640` inside a `0750` directory and the plan chowns
     the directory to group `sa-NAME`; a static unit additionally adds exactly `caddy`
-    to that group, and a python unit adds nobody.
+    to that group, and a python unit adds nobody. Re-applying the same name as a python
+    unit *removes* `caddy` from the group again and restarts Caddy.
 31. `smallapp apply` on an invalid target exits **1** (not 2), and `smallapp plan --out`
     pointed at a regular file exits 1 naming that path with no traceback.
 32. `rm` of an unknown unit leaves the tree hash unchanged, `rm` of a known unit leaves
@@ -383,6 +386,12 @@ Every item is checkable by `pytest` or by a command's exit code.
 33. `target.reads_port` accepts `os.getenv(key="PORT")` and rejects
     `Fake().getenv("PORT")`; `target.declares_dependencies` needs a whole PEP 723
     block, not a mention of the marker.
+34. A request the gateway rejects (bad token, oversized login, unknown `/_smallapp/*`
+    path, wrong method, unauthorised proxy) cannot leak its body into the next request
+    on the same keep-alive connection; a body that cannot be framed exactly is answered
+    413 and the connection closed.
+35. A failed `uv sync` at apply time leaves no success marker: the retry runs `uv sync`
+    again and the registry entry cannot reach `complete=true` without a successful one.
 
 ## Quality bar
 
