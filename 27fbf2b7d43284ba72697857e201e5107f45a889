@@ -1,0 +1,21 @@
+QA round 8 reasoning, for the next loop:
+
+- The body-drain fix is deliberately central rather than per-branch: every earlier
+  attempt at 'this branch also needs to read the body' regressed as soon as a new
+  route was added. _route now owns framing, handlers only see self.body. If you add
+  a route, you get the behaviour for free; if you read self.rfile again, you break it.
+- Chunked bodies are refused (413 + close) rather than decoded. The gateway sits
+  behind Caddy, which normalises to Content-Length, and a hand-rolled chunk parser is
+  exactly the kind of code that desynchronises connections.
+- The .synced marker lives inside the uv cache dir, so 'rm' takes it with the state
+  dir and a re-apply resolves again. It is written 0600 and owned by root like the
+  rest of the state dir; the unit only needs to read the cache, not the marker.
+- remove_group_member uses gpasswd --delete, not usermod --groups: usermod rewrites
+  the entire supplementary list, which would silently drop memberships smallapp does
+  not know about. It is a no-op when the membership is already gone, so apply stays
+  retryable.
+- Criterion 26: the old test would have crashed, not passed, on Linux — the skip hid
+  a bug in the test itself. Worth remembering that a permanently-skipped test is
+  untested code. The docker fallback pulls debian:bookworm-slim and apt-installs
+  systemd (~60s), which is why the test is marked slow. Recorded scores: both units
+  0.9 SAFE against the 4.0 limit, systemd 252.
