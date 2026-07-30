@@ -1,3 +1,34 @@
+## QA FINDINGS (round 7, 2026-07-29)
+
+1. **HIGH — A failed PEP 723 dependency sync is skipped on retry and the unit is
+   marked complete.** `src/smallapp/plan.py:203-204` treats an existing cache directory
+   as a successful sync, but `src/smallapp/system.py:330-336` creates that directory
+   before running `uv sync`. Reproduce by making `System._run` fail on its first
+   `uv sync`, then retrying the same `apply`: the second plan marks `deps` unchanged,
+   does not call `uv sync` again, and writes `complete=true`; the generated
+   `uv run --offline` service then has no resolved dependencies. Fixed means a failed
+   sync leaves no success marker (for example, sync into a temporary directory and
+   rename or write a completion marker only after success), retry runs `uv sync`
+   again, and a regression test proves the registry cannot become complete first.
+2. **MEDIUM — Switching a unit from static to Python leaves Caddy in the payload
+   group.** `src/smallapp/plan.py:155-165` only adds `caddy` for static units, while
+   `src/smallapp/system.py:307-320` has no operation to remove a supplementary group
+   member. Reproduce by applying a static target as `thing`, then applying a Python
+   target with the same name under `--root`: the second apply removes `index.html`
+   and writes `app.py`, but `var/lib/smallapp/groups/sa-thing` still contains `caddy`;
+   the real-host equivalent leaves Caddy able to read the Python payload. Fixed means
+   a static-to-Python transition removes `caddy` from `sa-NAME`, restarts Caddy so its
+   supplementary groups refresh, and a regression test asserts the membership is
+   revoked.
+3. **BLOCKER — Acceptance criterion 26 has still never been exercised.**
+   `tests/test_hardening.py:19-26` skips both hardening checks off Linux, and the clean
+   clone run on macOS reported `2 skipped`; `IMPLEMENTATION_PLAN.md:151-152` confirms
+   the criterion has never run. Reproduce with
+   `uv run pytest tests/test_hardening.py -rs` on macOS. Fixed means running both
+   rendered units through `systemd-analyze security --offline=true --json=short` on
+   Linux with systemd and recording exposure below 4.0 for each; until then the
+   mandatory hardening guarantee is unverified and QA cannot sign off.
+
 # Implementation plan
 
 Ordered vertical slices. Each ends with `uv run pytest && uv run ruff check . && uv run mypy src tests`
