@@ -221,6 +221,10 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy src tests
 ```
 
+The default suite needs network (two tests resolve real packages) and, off Linux,
+docker: the `systemd-analyze security` check runs inside `debian:bookworm-slim`.
+`uv run pytest -m "not slow"` skips both and still covers the logic.
+
 **Runtime dependencies: none.** Python's standard library only — nothing else
 survives `ProtectSystem=strict` for free, and the whole product is string rendering
 plus `subprocess`. `pytest`, `ruff`, and `mypy` are dev-only.
