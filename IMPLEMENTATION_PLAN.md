@@ -1,3 +1,52 @@
+## QA FINDINGS (round 11, 2026-07-29)
+
+1. **Critical — interrupted applies still permanently skip payload/state ownership.**
+   `src/smallapp/plan.py:148-155` and `src/smallapp/plan.py:170-179` mark ownership
+   unchanged from directory existence alone; `src/smallapp/apply.py:35-37` then skips
+   it. Reproduce by interrupting a real-host apply after `mkdir` but before `chgrp` or
+   `chown`, then retry: the existing directories make all three ownership actions
+   unchanged and the unit can reach `complete=true` without executing them. Fixed means
+   retries compare or safely reapply the required uid/gid, with a regression test that
+   interrupts before ownership and proves the retry performs every ownership action.
+
+2. **Critical — duplicate Content-Length headers desynchronise gateway connections.**
+   `src/smallapp/gateway.py:252-268` reads only the first value returned by
+   `self.headers.get("Content-Length")`. Reproduce over one raw socket with a login POST
+   containing `Content-Length: 5`, `Content-Length: 100`, 100 body bytes, then a valid
+   GET: the gateway returns 401, reads five bytes, and parses the remaining 95 bytes plus
+   `GET` as an unsupported method. Fixed means every duplicate Content-Length is rejected
+   with 413 and a closed connection, with a raw-socket regression test.
+
+3. **High — dependency resolution executes untrusted package build code as root.**
+   `src/smallapp/system.py:340-360` runs `uv sync --script` through
+   `src/smallapp/system.py:386-405`, reached from root-only apply in
+   `src/smallapp/cli.py:118-152`. Reproduce with a PEP 723 target depending on an
+   attacker-controlled sdist whose PEP 517 backend records `geteuid()`: its build hook
+   runs as uid 0 before systemd confinement exists. Fixed means resolution cannot execute
+   third-party build code as root and a test proves the resolver child is unprivileged.
+
+4. **High — pruning the lock directory can create two simultaneous exclusive locks.**
+   `src/smallapp/system.py:177-202` removes `/var/lib/smallapp`, while
+   `src/smallapp/system.py:204-222` locks that directory inode. Reproduce with process A
+   holding the lock, B opening the same inode and waiting, A pruning the directory and
+   releasing, then C recreating and locking the path: B and C lock different inodes
+   concurrently. Fixed means the lock inode is stable and never pruned, with a concurrent
+   rm/apply test proving registry writers cannot overlap.
+
+5. **Medium — PORT detection accepts unrelated attribute chains as the os module.**
+   `src/smallapp/target.py:53-57` accepts any attribute named `os`. Reproduce with
+   `reads_port('fake.os.getenv("PORT")')`, which returns `True` although the process
+   environment is never read. Fixed means only supported imports of the real `os` module
+   qualify, with `.os` impostors rejected by regression tests.
+
+6. **Medium — acceptance criterion 1 contradicts the default clean-checkout suite.**
+   `specs/smallapp-unit.md:297-298` permits no network beyond the Python package index,
+   but `tests/test_hardening.py:46-56` pulls `debian:bookworm-slim` and runs
+   `apt-get update`; `README.md:224-226` admits those extra requirements. Reproduce on
+   macOS with Docker available and Docker Hub or Debian mirrors blocked: default
+   `uv run pytest` collects the slow hardening test and fails. Fixed means the default
+   suite obeys criterion 1, or the criterion explicitly names every required service.
+
 ## QA FINDINGS (round 10, 2026-07-29)
 
 1. **Critical — interrupted applies still permanently skip payload/state ownership.**
